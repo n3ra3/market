@@ -1,0 +1,4 @@
+aiohttp==3.8.5
+websockets==11.0.3
+aiogram==2.25.1
+requests==2.31.0

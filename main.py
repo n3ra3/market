@@ -1,0 +1,1956 @@
+import asyncio
+import aiohttp
+from aiohttp import web
+import random
+import websockets
+import json
+import urllib.parse
+import time
+import hashlib
+import csv
+import logging
+import os
+import uuid
+
+# Configuration
+API_KEY = os.getenv("MARKET_API_KEY", "XDJGP3iT8cUj3sC2vsAbBiEh8iqc6Zx")  # Replace with your API key or set env MARKET_API_KEY
+DEBUG_MODE = os.getenv("MARKET_DEBUG", "1") in ("1", "true", "True")
+# You can target either by name_id (if using names.json / WS events) or by market_hash_name
+TARGET_NAME_ID = None  # Example: "12345" or None
+# Support multiple targets (comma-separated env var) e.g. "Sealed Genesis Terminal,Recoil Case"
+_targets_env = os.getenv("TARGET_MARKET_HASH_NAME", "Sealed Genesis Terminal")
+TARGET_MARKET_HASHES = [t.strip() for t in _targets_env.split(",") if t.strip()]
+# THRESHOLD: units where 1 USD = 1000 (so 1000 = $1.00). Compare against price * 1000
+THRESHOLD = 290  # Notify if price is below this value
+# How to apply ignore: 'id' = prefer listing id (default), 'name' = ignore by market_hash_name
+IGNORE_BY = os.getenv("IGNORE_BY", "id")  # 'id' or 'name'
+
+# Telegram settings (optional). You can set env MARKET_TELEGRAM_TOKEN and MARKET_TELEGRAM_CHAT_ID
+# Fallback to bot/config.py values if environment variables are not set.
+# Load by file path to avoid import conflicts with installed modules named 'bot'.
+bot_config = None
+try:
+    config_path = os.path.join(os.getcwd(), "bot", "config.py")
+    if os.path.exists(config_path):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("bot_config", config_path)
+        bot_config = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bot_config)
+    else:
+        # Last resort: try regular import if package is available on sys.path
+        try:
+            from bot import config as bot_config
+        except Exception:
+            bot_config = None
+except Exception:
+    bot_config = None
+
+TELEGRAM_BOT_TOKEN = os.getenv("MARKET_TELEGRAM_TOKEN") or (getattr(bot_config, "TELEGRAM_TOKEN", None) if bot_config else None)
+TELEGRAM_CHAT_ID = os.getenv("MARKET_TELEGRAM_CHAT_ID") or (str(getattr(bot_config, "CHAT_ID", "")) if bot_config else None)
+WS_URL = "wss://wsprice.csgo.com/connection/websocket"
+REST_PRICES_URL = "https://market.csgo.com/api/v2/prices/USD.json"
+GET_WS_TOKEN_URL = "https://market.csgo.com/api/v2/get-ws-token"
+WS_ORIGIN = os.getenv("WS_ORIGIN", "https://market.csgo.com")
+WS_USER_AGENT = os.getenv("WS_USER_AGENT", "market-bot/1.0")
+# Optional proxy configuration removed — proxies disabled by default
+# (If you later want proxies, set HTTP_PROXY or WS_PROXY and re-enable support.)
+# Fallback polling interval in seconds (default 10)
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))
+# Dedupe bucket size in seconds (used to group similar alerts). Default 120 (2 minutes)
+DEDUPE_BUCKET_SEC = int(os.getenv("DEDUPE_BUCKET_SEC", "120"))
+# Debounce window (seconds) to aggregate multiple near-simultaneous offers for same item
+DEBOUNCE_SEC = int(os.getenv("DEBOUNCE_SEC", "3"))
+# Maximum number of lots to buy in one aggregated AUTO window (0 = disabled)
+MAX_BATCH_BUY = int(os.getenv("MAX_BATCH_BUY", "0"))
+# Purchase log and spend limits
+PURCHASE_LOG = os.path.join(os.getcwd(), "purchase_history.csv")
+DAILY_SPEND_LIMIT_USD = float(os.getenv("DAILY_SPEND_LIMIT_USD", "0"))  # 0 = disabled
+SESSION_SPEND_LIMIT_USD = float(os.getenv("SESSION_SPEND_LIMIT_USD", "0"))  # 0 = disabled
+
+# Logging setup
+logging.basicConfig(level=logging.DEBUG if DEBUG_MODE else logging.INFO)
+logger = logging.getLogger("market")
+
+# Log whether Telegram is configured (without printing the token)
+if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+    logger.info("Telegram configured: yes")
+else:
+    logger.info("Telegram configured: no (messages will be printed)")
+
+# Persistent state for confirmed/ignored items
+STATE_FILE = os.path.join(os.getcwd(), "state.json")
+state = {"ignored": [], "confirmed": []}
+
+# Last state save timestamp for debouncing
+_last_state_save_ts = 0
+
+# In-memory pending custom threshold requests: chat_id -> hash_name
+awaiting_custom = {}
+# Recent observed prices per item for floating threshold calculations
+# structure: {name: [price_units, ...]}
+state.setdefault("recent_prices", {})
+
+# in-memory pending custom global threshold requests removed (no global manual)
+awaiting_global = set()
+
+# Persistent processed offer IDs (for dedupe and ignore). Keys are strings of numeric ids -> timestamp
+PROCESSED_FILE = os.path.join(os.getcwd(), "processed_ids.json")
+processed_ids = {}  # dict[str->int]
+# TTL for processed ids (seconds)
+PROCESSED_TTL = int(os.getenv("PROCESSED_TTL", str(10 * 60)))  # default 10 minutes
+
+
+# Добавлена функция ensure_storage_files для проверки и создания необходимых файлов
+def ensure_storage_files():
+    """Ensure that state.json exists with default content."""
+    try:
+        if not os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump({
+                    "mode": "MANUAL",
+                    "thresholds": {},
+                    "processed_alerts": {}
+                }, f, ensure_ascii=False, indent=2)
+            logger.info(f"Created missing state file: {STATE_FILE}")
+        else:
+            # Если файл существует, удалить поле "ignored", если оно есть
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                current_state = json.load(f)
+            if "ignored" in current_state:
+                del current_state["ignored"]
+                with open(STATE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(current_state, f, ensure_ascii=False, indent=2)
+                logger.info(f"Removed deprecated 'ignored' field from state file: {STATE_FILE}")
+            else:
+                logger.info(f"State file exists: {STATE_FILE}")
+    except Exception:
+        logger.exception("Failed to ensure state file")
+
+
+def load_state():
+    global state
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+                # ensure keys
+                state.setdefault("ignored", [])
+                state.setdefault("confirmed", [])
+    except Exception:
+        logger.exception("Failed to load state.json")
+
+
+def save_state(force: bool = False):
+    """Save state.json to disk. Debounced by `STATE_SAVE_INTERVAL` unless `force=True`.
+
+    Use `force=True` when immediate persistence is required (e.g., after recording a purchase).
+    """
+    try:
+        global _last_state_save_ts
+        now = int(time.time())
+        if not force and _last_state_save_ts and (now - _last_state_save_ts) < int(os.getenv("STATE_SAVE_INTERVAL", "5")):
+            # skip frequent saves
+            return
+
+        temp_file = f"{STATE_FILE}.tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        # Atomic replace
+        os.replace(temp_file, STATE_FILE)
+        _last_state_save_ts = now
+        try:
+            logger.info(f"State saved. thresholds keys={list(state.get('thresholds', {}).items())}")
+            try:
+                mtime = os.path.getmtime(STATE_FILE)
+                logger.info(f"State file mtime: {mtime}")
+            except Exception:
+                pass
+        except Exception:
+            logger.info("State saved (failed to list thresholds)")
+
+        # Write a small debug dump to inspect what was saved by this process
+        try:
+            dbg_file = f"{STATE_FILE}.debug"
+            with open(dbg_file, "w", encoding="utf-8") as df:
+                json.dump({"thresholds": state.get("thresholds", {}), "saved_at": now}, df, ensure_ascii=False, indent=2)
+        except Exception:
+            logger.exception("Failed to write debug state dump")
+    except Exception:
+        logger.exception("Failed to save state.json")
+
+
+def load_processed_ids():
+    global processed_ids
+    try:
+        if not os.path.exists(PROCESSED_FILE):
+            processed_ids = {}
+            save_processed_ids()  # Создать файл, если его нет
+        else:
+            with open(PROCESSED_FILE, "r", encoding="utf-8") as f:
+                processed_ids = json.load(f)
+                # ensure keys are strings and values are ints
+                processed_ids = {str(k): int(v) for k, v in processed_ids.items()}
+    except Exception:
+        logger.exception("Failed to load processed_ids.json")
+
+
+def save_processed_ids():
+    try:
+        temp_file = f"{PROCESSED_FILE}.tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(processed_ids, f, ensure_ascii=False, indent=2)
+        os.replace(temp_file, PROCESSED_FILE)  # Атомарная замена
+    except Exception:
+        logger.exception("Failed to save processed_ids.json")
+
+
+def cleanup_processed_ids(ttl: int = PROCESSED_TTL):
+    """Remove entries older than ttl seconds."""
+    try:
+        now = int(time.time())
+        removed = []
+        for k, v in list(processed_ids.items()):
+            if now - int(v) > ttl:
+                removed.append(k)
+                processed_ids.pop(k, None)
+        if removed:
+            logger.debug(f"Cleaned processed_ids: removed {len(removed)} entries")
+            save_processed_ids()
+    except Exception:
+        logger.exception("Failed during cleanup of processed_ids")
+
+
+def is_processed_offer(offer_id) -> bool:
+    try:
+        if offer_id is None:
+            return False
+        key = str(int(offer_id))
+        ts = processed_ids.get(key)
+        if not ts:
+            return False
+        # check TTL
+        if int(time.time()) - int(ts) > PROCESSED_TTL:
+            # expired
+            processed_ids.pop(key, None)
+            save_processed_ids()
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def add_processed_offer(offer_id):
+    try:
+        key = str(int(offer_id))
+        processed_ids[key] = int(time.time())
+        save_processed_ids()
+    except Exception:
+        logger.exception("Failed to add processed offer")
+
+
+def make_item_key_from_raw(raw: dict) -> str:
+    # Prefer stable ids if present
+    if not raw:
+        return ""
+    for k in ("id", "name_id", "market_id"):
+        v = raw.get(k)
+        if v:
+            return str(v)
+    # fallback to market_hash_name
+    name = raw.get("market_hash_name") or raw.get("name")
+    if name:
+        return name.strip().lower()
+    return ""
+
+
+def normalize_name(name: str) -> str:
+    """Normalize item names for use as keys in state (case-insensitive)."""
+    if not name:
+        return ""
+    try:
+        return str(name).strip().lower()
+    except Exception:
+        return str(name).strip()
+
+
+def make_item_key(data: dict, prefer: str = "id") -> str:
+    # data may contain 'raw' (REST) or just 'name'/'price'
+    raw = data.get("raw") if isinstance(data, dict) else None
+    name = data.get("name") or data.get("market_hash_name") if isinstance(data, dict) else None
+
+    # prefer by id: use id fields if available, else fallback to name
+    if prefer == "id":
+        if raw and isinstance(raw, dict):
+            # prefer stable id fields
+            for k in ("id", "name_id", "market_id"):
+                v = raw.get(k)
+                if v:
+                    return str(v)
+        # if no id available, return empty key so ignores apply strictly by ID
+        # (do NOT fallback to name-based keys when IGNORE_BY='id')
+        return ""
+
+    # prefer by name: use market_hash_name if available, else ids
+    if prefer == "name":
+        if name:
+            return name.strip().lower()
+        if raw and isinstance(raw, dict):
+            by_raw = make_item_key_from_raw(raw)
+            if by_raw:
+                return by_raw
+
+    # last resort: hash of repr
+    try:
+        return hashlib.sha1(repr(data).encode()).hexdigest()[:12]
+    except Exception:
+        return ""
+
+
+def extract_offer_id(raw) -> int | None:
+    """Extract numeric offer_id from raw dict if present. Returns int or None."""
+    if not raw or not isinstance(raw, dict):
+        return None
+    for k in ("offer_id", "id", "offerId", "listing_id", "item_id"):
+        v = raw.get(k)
+        if v is None:
+            continue
+        try:
+            return int(v)
+        except Exception:
+            # try to extract digits
+            s = str(v)
+            digits = "".join(ch for ch in s if ch.isdigit())
+            if digits:
+                try:
+                    return int(digits)
+                except Exception:
+                    continue
+    return None
+
+
+def _today_str():
+    return time.strftime("%Y-%m-%d")
+
+
+def can_spend(amount_usd):
+    """Check daily and session spend limits. Returns (True, '') if allowed, else (False, reason)."""
+    try:
+        if amount_usd is None:
+            return False, "invalid amount"
+        today = _today_str()
+        spent_today = float(state.setdefault("spent", {}).get(today, 0.0) or 0.0)
+        session_spent = float(state.get("session_spent", 0.0) or 0.0)
+        if DAILY_SPEND_LIMIT_USD and (spent_today + amount_usd) > DAILY_SPEND_LIMIT_USD:
+            return False, "daily limit exceeded"
+        if SESSION_SPEND_LIMIT_USD and (session_spent + amount_usd) > SESSION_SPEND_LIMIT_USD:
+            return False, "session limit exceeded"
+        return True, ""
+    except Exception:
+        logger.exception("can_spend failed")
+        return False, "error"
+
+
+def record_purchase(hash_name, price_units, offer_id=None, raw=None, source="manual"):
+    """Append successful purchase to CSV and update spend counters in state."""
+    try:
+        price_usd = float(price_units) / 1000.0 if price_units is not None else 0.0
+        ts = int(time.time())
+        today = _today_str()
+        header = ["timestamp", "iso", "name", "price_units", "price_usd", "offer_id", "source", "raw_json"]
+        iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+        row = [ts, iso, hash_name, price_units, f"{price_usd:.3f}", offer_id or "", source, json.dumps(raw or {}, ensure_ascii=False)]
+        write_header = not os.path.exists(PURCHASE_LOG)
+        with open(PURCHASE_LOG, "a", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(header)
+            writer.writerow(row)
+
+        # update state counters
+        state["session_spent"] = float(state.get("session_spent", 0.0) or 0.0) + price_usd
+        state.setdefault("spent", {})
+        state["spent"][today] = float(state["spent"].get(today, 0.0) or 0.0) + price_usd
+        # Force immediate save after recording a purchase
+        save_state(force=True)
+        logger.info(f"Recorded purchase: {hash_name} ${price_usd:.3f} to {PURCHASE_LOG}")
+    except Exception:
+        logger.exception("Failed to record purchase")
+
+# Helpers for history parsing: price extraction, normalization, and purchase detection
+def extract_price_raw(item):
+    """Try to extract a raw price value from a history item dict.
+    Returns the raw value (int/float/str/dict) or None.
+    """
+    try:
+        if not item or not isinstance(item, dict):
+            return None
+        # common flat keys
+        for k in ("price", "value", "cost", "sum", "amount", "price_usd", "money"):
+            if k in item:
+                v = item.get(k)
+                if v is not None:
+                    return v
+        # nested containers
+        for container in ("data", "raw", "offer", "item"):
+            v = item.get(container)
+            if isinstance(v, dict):
+                for k in ("price", "value", "cost", "amount", "price_usd"):
+                    if k in v:
+                        return v.get(k)
+        return None
+    except Exception:
+        return None
+
+
+def normalize_price(raw_p):
+    """Normalize extracted raw price into USD float when possible.
+    Heuristics:
+    - numeric values >1000 are treated as "units" and divided by 1000
+    - numeric values <=1000 are treated as USD if fractional or plausible
+    - strings are parsed to float after removing $/USD
+    - dicts are inspected for common keys
+    Returns float (USD) or None.
+    """
+    try:
+        if raw_p is None:
+            return None
+        if isinstance(raw_p, (int, float)):
+            num = float(raw_p)
+            if num > 1000:
+                return num / 1000.0
+            return float(num)
+        if isinstance(raw_p, str):
+            s = raw_p.strip().replace(',', '.')
+            s = s.replace('$', '').replace('USD', '').strip()
+            try:
+                num = float(s)
+            except Exception:
+                return None
+            if num > 1000:
+                return num / 1000.0
+            return num
+        if isinstance(raw_p, dict):
+            for k in ("amount", "price", "value", "price_usd"):
+                if k in raw_p:
+                    return normalize_price(raw_p.get(k))
+        return None
+    except Exception:
+        return None
+
+
+def is_purchase_entry(item) -> bool:
+    """Heuristic: determine whether a history entry represents a purchase."""
+    try:
+        if not item or not isinstance(item, dict):
+            return False
+        # explicit string indicators
+        for k in ("type", "action", "side", "direction", "event", "status"):
+            v = item.get(k)
+            if isinstance(v, str) and "buy" in v.lower():
+                return True
+        # buyer presence or buyer id fields
+        for k in ("buyer", "buyer_id", "user", "user_id"):
+            if k in item and item.get(k):
+                return True
+        # fallback: presence of price + offer/listing id
+        if any(k in item for k in ("price", "value")) and any(k in item for k in ("offer_id", "id", "listing_id", "item_id")):
+            return True
+        return False
+    except Exception:
+        return False
+
+# Вызов ensure_storage_files перед загрузкой состояния
+ensure_storage_files()
+
+# Логирование путей к файлам
+logger.info(f"State file path: {STATE_FILE}, exists: {os.path.exists(STATE_FILE)}")
+logger.info(f"Processed IDs file path: {PROCESSED_FILE}, exists: {os.path.exists(PROCESSED_FILE)}")
+
+# Загрузка состояния
+load_state()
+
+# Ensure some default keys exist in `state` to avoid KeyError and to use global THRESHOLD
+state.setdefault("processed_alerts", {})
+state.setdefault("mode", "MANUAL")
+state.setdefault("thresholds", {})
+state.setdefault("global_threshold", THRESHOLD)
+state.setdefault("session_spent", 0.0)
+state.setdefault("spent", {})
+# Normalize any existing threshold keys so lookups by normalized name work
+try:
+    thr = state.get("thresholds", {}) or {}
+    new_thr = {}
+    changed = False
+    for k, v in thr.items():
+        nk = normalize_name(k)
+        # prefer existing value if collision
+        if nk in new_thr and new_thr[nk] != v:
+            logger.warning(f"Threshold key collision when normalizing '{k}' -> '{nk}'; keeping existing value {new_thr[nk]}")
+            continue
+        new_thr[nk] = v
+        if nk != k:
+            changed = True
+    if changed:
+        state["thresholds"] = new_thr
+        save_state()
+        logger.info("Normalized threshold keys in state.json to lowercase keys for consistent lookup")
+except Exception:
+    logger.exception("Failed to normalize threshold keys on startup")
+
+async def get_ws_token(session):
+    """Fetch WebSocket token using REST API."""
+    try:
+        async with session.get(GET_WS_TOKEN_URL, params={"key": API_KEY}) as response:
+            text = await response.text()
+    except asyncio.CancelledError:
+        # Allow cancellation to propagate gracefully during shutdown
+        return None
+    except Exception:
+        logger.exception("get_ws_token request failed")
+        return None
+        # Log raw response for debugging
+        if DEBUG_MODE:
+            logger.debug(f"get-ws-token raw response: {text[:500]}")
+
+        try:
+            data = json.loads(text)
+        except Exception:
+            logger.error("get-ws-token returned non-JSON response")
+            return None
+
+        # Check for token existence safely (API may return 'token' or 'ws_token')
+        token = data.get("ws_token") or data.get("token")
+        if data.get("success") and token:
+            return token
+        else:
+            logger.error(f"Failed to get WS token: {data}")
+            return None
+
+# Define a global aiohttp.ClientSession
+session = None
+
+async def init_session():
+    global session
+    if session is None:
+        # Create a regular ClientSession (no proxy by default)
+        session = aiohttp.ClientSession()
+
+async def close_session():
+    global session
+    if session:
+        await session.close()
+        session = None
+
+async def websocket_listener():
+    """Connect to WebSocket and listen for market events."""
+    await init_session()  # Ensure session is initialized
+
+    # Start background poller for Telegram callback queries if configured
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        logger.info("Starting Telegram poller task (poll_telegram_updates)")
+        asyncio.create_task(poll_telegram_updates())
+
+        # Send a small startup notification to ensure bot/token/chat work
+        async def _startup_ping():
+            try:
+                await send_simple_message(session, TELEGRAM_CHAT_ID, "Bot started and poller scheduled.")
+                logger.info("Startup ping sent to Telegram chat")
+            except Exception:
+                logger.exception("Failed to send startup ping")
+
+        asyncio.create_task(_startup_ping())
+
+        # Also send the interactive menu at startup so user can enable AUTO/thresholds quickly
+        async def _startup_menu():
+            try:
+                await handle_menu_command(session, TELEGRAM_CHAT_ID)
+                logger.info("Startup menu sent to Telegram chat")
+            except Exception:
+                logger.exception("Failed to send startup menu")
+
+        asyncio.create_task(_startup_menu())
+
+    # Attempt to maintain a persistent WS connection with reconnects
+    fallback_task = None
+    retry_delay = 1
+    load_processed_ids()
+    cleanup_processed_ids()
+    asyncio.create_task(periodic_processed_cleanup())
+
+    while True:
+        try:
+            ws_token = await get_ws_token(session)
+            if not ws_token:
+                raise Exception("No ws_token received")
+
+            # If fallback was running, cancel it (we have WS now)
+            if fallback_task and not fallback_task.done():
+                fallback_task.cancel()
+
+            # add optional headers (User-Agent/Origin) which can help with some CDNs/proxies
+            extra_headers = [("User-Agent", WS_USER_AGENT), ("Origin", WS_ORIGIN)]
+            async with websockets.connect(f"{WS_URL}?token={ws_token}", extra_headers=extra_headers, ping_interval=20, open_timeout=10) as websocket:
+                subscription_message = json.dumps({"type": "subscribe", "data": "public:items:730:usd"})
+                await websocket.send(subscription_message)
+                if DEBUG_MODE:
+                    logger.debug(f"Sent subscription message: {subscription_message}")
+
+                retry_delay = 1
+                while True:
+                    message = await websocket.recv()
+                    if DEBUG_MODE:
+                        try:
+                            raw = message if isinstance(message, str) else message.decode(errors='ignore')
+                        except Exception:
+                            raw = str(message)
+                        logger.debug(f"Received raw message: {raw[:500]}")
+
+                    raw_msg = message if isinstance(message, str) else None
+                    if raw_msg is None:
+                        logger.debug("Received non-text WS frame")
+                        continue
+
+                    if raw_msg.startswith("a"):
+                        payload = raw_msg[1:]
+                        try:
+                            parsed = json.loads(payload)
+                            events = parsed[0] if isinstance(parsed, list) and parsed else parsed
+                            process_event(events)
+                        except json.JSONDecodeError:
+                            logger.error(f"Failed to decode JSON payload: {payload[:200]}")
+                    elif raw_msg.startswith("o"):
+                        logger.debug("SockJS open frame received.")
+                    elif raw_msg.startswith("h"):
+                        logger.debug("SockJS heartbeat frame received.")
+                    else:
+                        # Unknown frame format — log first to help debugging
+                        logger.debug(f"Unknown WS frame: {raw_msg[:200]}")
+
+        except Exception as e:
+            logger.error(f"WebSocket error: {e}")
+            # jittered exponential backoff with cap
+            retry_delay = min(retry_delay * 2, 30)
+            sleep_for = retry_delay + random.uniform(0, 1.5)
+            logger.info(f"WS reconnect sleeping {sleep_for:.2f}s before retry")
+            await asyncio.sleep(sleep_for)
+
+        # Start fallback task if WebSocket fails
+        if not fallback_task or fallback_task.done():
+            fallback_task = asyncio.create_task(fallback_polling())
+
+async def fallback_polling():
+    """Fallback to REST API polling if WebSocket fails."""
+    # Reuse global session to avoid creating/destroying client sessions frequently
+    await init_session()
+    global session
+    while True:
+        try:
+            async with session.get(REST_PRICES_URL, params={"key": API_KEY}) as response:
+                data = await response.json()
+
+            if data.get("success"):
+                items = data.get("items", [])
+                logger.info(f"Fallback: fetched {len(items)} items")
+                if DEBUG_MODE and items:
+                    try:
+                        sample = items[:3]
+                        logger.debug(f"Fallback sample items: {json.dumps(sample)[:1000]}")
+                    except Exception:
+                        logger.debug(f"Fallback sample (repr): {repr(items[:3])}")
+
+                # Only process items matching any target in TARGET_MARKET_HASHES to reduce noise
+                for item in items:
+                    # extract offer id and skip if already processed
+                    offer_id = extract_offer_id(item)
+                    if offer_id and is_processed_offer(offer_id):
+                        continue
+
+                    name = (item.get("market_hash_name") or item.get("name") or "")
+                    # filter by name_id or market_hash_name targets
+                    if TARGET_NAME_ID:
+                        if str(item.get("name_id")) != str(TARGET_NAME_ID):
+                            continue
+                    else:
+                        if not any(t.lower() in name.lower() for t in TARGET_MARKET_HASHES):
+                            continue
+
+                    process_item(item)
+            else:
+                logger.error(f"Failed to fetch prices: {data}")
+        except Exception as e:
+            logger.error(f"Polling error: {e}")
+
+        await asyncio.sleep(POLL_INTERVAL)
+
+def find_cheapest_lot(items):
+    """Find the cheapest lot from a list of items."""
+    try:
+        return min(items, key=lambda x: float(x.get("price", float("inf"))))
+    except Exception:
+        logger.exception("Failed to find the cheapest lot.")
+        return None
+
+# Temporary storage for pending offers
+pending_offers = {}
+
+# Helper: enqueue offers for debounced AUTO buying
+def enqueue_pending_auto(name: str, price_units: int, threshold_units: int = None, raw: dict | None = None):
+    try:
+        norm = normalize_name(name)
+        bucket = int(time.time() // DEDUPE_BUCKET_SEC)
+        key = f"{norm}|{bucket}"
+        entry = pending_offers.setdefault(key, {"name": name, "bucket": bucket, "offers": [], "task": None, "threshold_units": threshold_units})
+        # keep the lowest threshold if multiple enqueue calls provide different thresholds
+        if threshold_units is not None:
+            existing = entry.get("threshold_units")
+            if existing is None or threshold_units < existing:
+                entry["threshold_units"] = threshold_units
+        entry["offers"].append({"price_units": int(price_units), "raw": raw})
+        # schedule debounced task once
+        if not entry.get("task"):
+            entry["task"] = asyncio.create_task(debounced_auto_buy(key))
+        logger.debug(f"Enqueued pending auto offer: key={key} price={price_units} total_offers={len(entry['offers'])}")
+    except Exception:
+        logger.exception("Failed to enqueue pending auto offer")
+
+
+async def debounced_auto_buy(key: str):
+    """Wait DEBOUNCE_SEC seconds and attempt a single purchase for aggregated offers keyed by name|bucket."""
+    try:
+        await asyncio.sleep(DEBOUNCE_SEC)
+        entry = pending_offers.pop(key, None)
+        if not entry:
+            return
+        name = entry.get("name")
+        bucket = entry.get("bucket")
+        offers = entry.get("offers", [])
+        if not offers:
+            return
+        # choose cheapest offer
+        cheapest = min(offers, key=lambda o: o.get("price_units", 10**12))
+        price_units = int(cheapest.get("price_units"))
+        logger.info(f"Debounced AUTO buy: attempting single purchase for '{name}' cheapest={price_units/1000.0:.3f} USD from {len(offers)} offers")
+
+        # final safety check: only proceed if still in AUTO mode
+        if state.get("mode") != "AUTO":
+            logger.warning(f"Debounced AUTO buy aborted: current mode={state.get('mode')}")
+            return
+
+        # Reuse global session for notifications to avoid creating many ClientSession objects
+        try:
+            await init_session()
+            s = session
+            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                await send_simple_message(s, TELEGRAM_CHAT_ID, f"AUTO: aggregated {len(offers)} offers for {name}, buying cheapest ${price_units/1000.0:.3f}")
+        except Exception:
+            logger.exception("Failed to send debounced AUTO attempt message")
+
+        # Determine threshold to use for fetching current offers (prefer stored threshold)
+        threshold_units = entry.get("threshold_units") or price_units
+        try:
+            offers_now = await fetch_available_offers(name, threshold_units)
+        except Exception:
+            offers_now = []
+
+        # Decide how many to attempt: if MAX_BATCH_BUY <= 0 -> buy all available; otherwise cap
+        available = len(offers_now)
+        if available == 0:
+            to_buy = 1
+        elif MAX_BATCH_BUY <= 0:
+            to_buy = available
+        else:
+            to_buy = min(available, MAX_BATCH_BUY)
+
+        bought_count = 0
+        last_err = None
+        purchases_made = []
+        for i in range(to_buy):
+            if state.get("mode") != "AUTO":
+                logger.warning("Aborting batch buy: mode switched from AUTO")
+                break
+            target_offer = offers_now[i] if i < len(offers_now) else cheapest
+            tgt_price = int(target_offer.get("price_units", price_units))
+            allowed, reason = can_spend(tgt_price / 1000.0)
+            if not allowed:
+                logger.warning(f"Batch buy stopped by spend limits: {reason}")
+                break
+            ok, res = await buy_item(name, tgt_price, source="auto", raw=target_offer.get("raw") if isinstance(target_offer, dict) else None)
+            if ok:
+                bought_count += 1
+                try:
+                    purchases_made.append({"price_units": tgt_price, "id": res, "ts": int(time.time())})
+                except Exception:
+                    purchases_made.append({"price_units": tgt_price, "id": res})
+            else:
+                last_err = res
+                logger.warning(f"Batch buy attempt failed for {name} at {tgt_price/1000.0:.3f}: {res}")
+                break
+
+        if bought_count:
+            logger.info(f"Debounced AUTO buys completed for {name}: bought {bought_count}/{to_buy} lots")
+            try:
+                now_ts = int(time.time())
+                for o in offers:
+                    a_key = f"{name}|{o.get('price_units')}|{bucket}"
+                    state.setdefault("processed_alerts", {})[a_key] = now_ts
+                save_state()
+            except Exception:
+                logger.exception("Failed to mark aggregated offers processed")
+            # Send detailed report to Telegram (one line per purchase)
+            try:
+                await init_session()
+                s = session
+                lines = [f"AUTO batch report: {bought_count} bought for {name}"]
+                total = 0.0
+                for idx, p in enumerate(purchases_made, start=1):
+                    pu = int(p.get("price_units", 0))
+                    total += (pu / 1000.0)
+                    pid = p.get("id") or "-"
+                    tstr = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(p.get("ts", int(time.time()))))
+                    lines.append(f"{idx}. ${pu/1000.0:.3f} id={pid} at {tstr}")
+                lines.append(f"Total: ${total:.3f}")
+                text = "\n".join(lines)
+                # If too long, send as document
+                if len(text) > 3500:
+                    # write temp file
+                    fp = os.path.join(os.getcwd(), f"auto_report_{int(time.time())}.txt")
+                    with open(fp, "w", encoding="utf-8") as tf:
+                        tf.write(text)
+                    await send_document(s, TELEGRAM_CHAT_ID, fp, filename=os.path.basename(fp))
+                    try:
+                        os.remove(fp)
+                    except Exception:
+                        pass
+                else:
+                    await send_simple_message(s, TELEGRAM_CHAT_ID, text)
+            except Exception:
+                logger.exception("Failed to send detailed AUTO batch report")
+        else:
+            logger.warning(f"Debounced AUTO buy failed for {name}: {last_err}")
+            try:
+                async with aiohttp.ClientSession() as s:
+                    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                        await send_simple_message(s, TELEGRAM_CHAT_ID, f"AUTO: failed to buy {name}: {last_err}")
+            except Exception:
+                logger.exception("Failed to send debounced AUTO failure message")
+    except Exception:
+        logger.exception("Error in debounced_auto_buy")
+
+
+async def fetch_available_offers(name: str, max_price_units: int):
+    """Fetch current REST listings and return list of offers for `name` with price_units <= max_price_units.
+    Returns list of dicts with keys including 'price_units' and 'raw'."""
+    try:
+        await init_session()
+        s = session
+        async with s.get(REST_PRICES_URL, params={"key": API_KEY}, timeout=20) as resp:
+            data = await resp.json()
+
+        if not data.get("success"):
+            return []
+        items = data.get("items") or []
+        matches = []
+        norm = normalize_name(name)
+        for it in items:
+            try:
+                it_name = it.get("market_hash_name") or it.get("name") or ""
+                if normalize_name(it_name) != norm:
+                    continue
+                raw_price = it.get("price") or it.get("value")
+                if raw_price is None:
+                    continue
+                p = float(raw_price)
+                pu = int(p * 1000)
+                if pu <= int(max_price_units):
+                    offer_id = extract_offer_id(it)
+                    if offer_id and is_processed_offer(offer_id):
+                        continue
+                    matches.append({"price_units": pu, "raw": it, "offer_id": offer_id})
+            except Exception:
+                continue
+        matches.sort(key=lambda x: x.get("price_units", 10**12))
+        return matches
+    except Exception:
+        logger.exception("Failed to fetch available offers")
+        return []
+
+# Update process_event to handle the cheapest lot logic
+def process_event(event):
+    """Process a WebSocket event."""
+    try:
+        if not isinstance(event, dict):
+            return
+
+        name = event.get("market_hash_name") or event.get("name") or ""
+        raw_price = event.get("price") or event.get("value")
+        if raw_price is None:
+            return
+
+        try:
+            price_float = float(raw_price)
+            price_units = int(price_float * 1000)
+        except Exception:
+            return
+
+        # Use normalized name for recent prices and thresholds
+        norm = normalize_name(name)
+        recent = state.setdefault("recent_prices", {}).setdefault(norm, [])
+        recent.append(price_units)
+        # keep last 20 prices
+        if len(recent) > 20:
+            recent[:] = recent[-20:]
+        # compute baseline as median of recent prices
+        try:
+            sorted_recent = sorted(recent)
+            mid = len(sorted_recent) // 2
+            if len(sorted_recent) % 2 == 1:
+                baseline = sorted_recent[mid]
+            else:
+                baseline = (sorted_recent[mid - 1] + sorted_recent[mid]) // 2
+        except Exception:
+            baseline = THRESHOLD
+
+        # floating margin percent (default 10%) — notify if price is below baseline * (1 - margin)
+        floating_margin = float(state.get("floating_margin_pct", 0.10))
+
+        cfg_threshold = state.get("thresholds", {}).get(norm)
+        try:
+            if cfg_threshold is not None:
+                effective_threshold_units = int(cfg_threshold)
+            else:
+                effective_threshold_units = int(baseline * (1.0 - floating_margin))
+        except Exception:
+            effective_threshold_units = THRESHOLD
+        # persist recent prices periodically
+        save_state()
+
+        # If price (in units) is higher than the effective threshold, skip
+        # Log decision details for debugging
+        logger.debug(f"WS check for '{name}': price_units={price_units}, effective_threshold_units={effective_threshold_units}, cfg_threshold={cfg_threshold}")
+        if price_units > effective_threshold_units:
+            logger.debug(f"Skipping WS item '{name}': price {price_units} > threshold {effective_threshold_units}")
+            return
+
+        # Защита от спама
+        timestamp_bucket = int(time.time() // DEDUPE_BUCKET_SEC)
+        alert_key = f"{name}|{price_units}|{timestamp_bucket}"
+        if alert_key in state["processed_alerts"]:
+            return
+        state["processed_alerts"][alert_key] = int(time.time())
+        save_state()
+
+        if state.get("mode") == "AUTO":
+            # Aggregate near-simultaneous offers and debounce actual buy
+            enqueue_pending_auto(name, price_units, threshold_units=effective_threshold_units, raw=event)
+        else:
+            # Notify asynchronously
+            asyncio.create_task(notify_telegram({
+                "source": "ws",
+                "name": name,
+                "price": price_float,
+                "lot_key": alert_key,
+                "raw": event
+            }))
+    except Exception:
+        logger.exception("Error processing WS event")
+
+# Логика AUTO-режима
+async def handle_auto_mode(name, price_units):
+    """Handle automatic purchase logic."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Получаем текущий баланс пользователя
+            async with session.get(f"https://market.csgo.com/api/v2/get-money", params={"key": API_KEY}) as response:
+                data = await response.json()
+                if data.get("success"):
+                    balance_usd = float(data.get("money", 0))
+                    # Проверяем, хватает ли баланса для покупки
+                    if balance_usd >= (price_units / 1000):
+                        # Логируем попытку покупки и уведомляем кратко (без кнопок)
+                        logger.info(f"AUTO found: {name} for {price_units / 1000:.2f} USD. Attempting purchase...")
+                        try:
+                            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                                await send_simple_message(session, TELEGRAM_CHAT_ID, f"AUTO: attempting to buy {name} for ${price_units/1000:.3f}")
+                            else:
+                                print(f"AUTO: attempting to buy {name} for ${price_units/1000:.3f}")
+                        except Exception:
+                            logger.exception("Failed to send AUTO attempt message")
+
+                        # Check spend limits before attempting
+                        allowed, reason = can_spend(price_units / 1000.0)
+                        if not allowed:
+                            logger.warning(f"AUTO purchase blocked by limits: {reason}")
+                            try:
+                                if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                                    await send_simple_message(session, TELEGRAM_CHAT_ID, f"AUTO: blocked purchase of {name} for ${price_units/1000:.3f}: {reason}")
+                                else:
+                                    print(f"AUTO blocked: {reason}")
+                            except Exception:
+                                logger.exception("Failed to send AUTO block message")
+                            return
+
+                        # Perform purchase via centralized function
+                        ok, res = await buy_item(name, price_units, source="auto", raw={"price_units": price_units})
+                        if ok:
+                            try:
+                                if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                                    await send_simple_message(session, TELEGRAM_CHAT_ID, f"AUTO: bought {name} for ${price_units/1000:.3f}")
+                                else:
+                                    print(f"AUTO: bought {name} for ${price_units/1000:.3f}")
+                            except Exception:
+                                logger.exception("Failed to send AUTO success message")
+                            return
+                        else:
+                            logger.warning(f"Не удалось выполнить покупку: {res}")
+                            try:
+                                if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                                    await send_simple_message(session, TELEGRAM_CHAT_ID, f"AUTO: failed to buy {name}: {res}")
+                                else:
+                                    print(f"AUTO: failed to buy {name}: {res}")
+                            except Exception:
+                                logger.exception("Failed to send AUTO failure message")
+                else:
+                    logger.warning("Не удалось получить баланс пользователя")
+    except Exception as e:
+        logger.exception(f"Ошибка в логике автозакупки: {e}")
+
+
+async def handle_telegram_callback(data_cd, cq_id, session, cq=None):
+    """Handle Telegram callback actions."""
+    try:
+        # determine chat id from callback_query message if available
+        chat_id = str(TELEGRAM_CHAT_ID)
+        try:
+            if isinstance(cq, dict) and cq.get("message") and cq["message"].get("chat"):
+                chat_id = str(cq["message"]["chat"].get("id", chat_id))
+        except Exception:
+            pass
+
+        logger.debug(f"handle_telegram_callback called: data_cd={data_cd} cq_id={cq_id} chat_id={chat_id}")
+
+        if data_cd.startswith("set_mode:"):
+            mode = data_cd.split(":", 1)[1]
+            state["mode"] = mode
+            save_state()
+            await answer_callback(session, cq_id, f"Mode set to {mode}")
+            await handle_menu_command(session, chat_id)  # Обновить меню
+            return
+        if data_cd == "toggle_mode":
+            # Toggle between AUTO and MANUAL
+            current = state.get("mode", "MANUAL")
+            new = "AUTO" if current != "AUTO" else "MANUAL"
+            state["mode"] = new
+            save_state()
+            await answer_callback(session, cq_id, f"Mode set to {new}")
+            await handle_menu_command(session, chat_id)
+            return
+        # accept both 'set_custom|' and 'set_custom:' formats
+        if data_cd.startswith("set_custom:") or data_cd.startswith("set_custom|"):
+            # user clicked Custom -> ask them to send a price in chat
+            try:
+                parts = data_cd.replace(":", "|").split("|", 2)
+                hash_enc = parts[1]
+            except Exception:
+                await answer_callback(session, cq_id, "Invalid custom request.")
+                return
+            hash_name = urllib.parse.unquote_plus(hash_enc)
+            # remember that this chat expects a custom price for this hash_name
+            awaiting_custom[chat_id] = hash_name
+            # Debug: log awaiting_custom after setting
+            try:
+                logger.debug(f"awaiting_custom set for chat {chat_id}: hash_name={hash_name}. keys={list(awaiting_custom.keys())}")
+            except Exception:
+                logger.debug("awaiting_custom updated (debug failed to format keys)")
+            await answer_callback(session, cq_id, f"Send custom price (USD) for {hash_name} in chat now.")
+            # Send a ForceReply so Telegram clients prompt the user to reply and update will contain the message
+            try:
+                fr_payload = {"chat_id": chat_id, "text": f"Please reply with a price in USD for '{hash_name}', e.g. 0.29", "reply_markup": json.dumps({"force_reply": True, "selective": True})}
+                send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                async with session.post(send_url, json=fr_payload) as fr_resp:
+                    fr_text = await fr_resp.text()
+                    if fr_resp.status != 200:
+                        logger.error(f"Failed to send force-reply prompt: {fr_resp.status} {fr_text}")
+                    else:
+                        logger.debug(f"Force-reply prompt sent: {fr_text[:200]}")
+            except Exception:
+                logger.exception("Failed to send force-reply prompt")
+            return
+
+        # No global manual threshold: ignore any set_global* callbacks
+        if data_cd.startswith("set_global"):
+            await answer_callback(session, cq_id, "Global manual threshold disabled. Use per-item Custom buttons.")
+            return
+
+        parts = data_cd.split("|", 2)
+        action = parts[0]
+        hash_enc = parts[1] if len(parts) > 1 else ""
+        limit = parts[2] if len(parts) > 2 else "0"
+        hash_name = urllib.parse.unquote_plus(hash_enc) if hash_enc else ""
+        try:
+            limit_units = int(limit)
+        except Exception:
+            limit_units = 0
+        logger.debug(f"Parsed callback parts: action={action}, hash_name={hash_name}, limit_units={limit_units}")
+
+        if action == "confirm_buy":
+            async with session.get(f"https://market.csgo.com/api/v2/get-money", params={"key": API_KEY}) as response:
+                data = await response.json()
+                logger.debug(f"get-money response for confirm_buy: {data}")
+                if data.get("success"):
+                            # API returns money as USD float (e.g. 18.191)
+                            balance_usd = float(data.get("money", 0))
+                            logger.debug(f"Balance (USD): {balance_usd}, limit_units: {limit_units}, limit_USD: {limit_units/1000:.3f}")
+                            if balance_usd >= (limit_units / 1000):
+                                # Check spend limits
+                                allowed, reason = can_spend(limit_units / 1000.0)
+                                if not allowed:
+                                    await answer_callback(session, cq_id, "Blocked by spend limits")
+                                    await send_simple_message(session, chat_id, f"Purchase blocked: {reason}")
+                                else:
+                                    ok, res = await buy_item(hash_name, limit_units, source="manual_confirm")
+                                    logger.debug(f"buy response: {res}")
+                                    if ok:
+                                        await answer_callback(session, cq_id, "Purchase successful.")
+                                        await send_simple_message(session, chat_id, f"Successfully bought {hash_name} for {limit_units / 1000:.2f} USD.")
+                                    else:
+                                        await answer_callback(session, cq_id, "Purchase failed.")
+                                        await send_simple_message(session, chat_id, f"Failed to buy {hash_name}: {res}")
+                            else:
+                                await answer_callback(session, cq_id, "Insufficient funds.")
+                                await send_simple_message(session, chat_id, "Insufficient funds for purchase.")
+                else:
+                            await answer_callback(session, cq_id, "Failed to fetch balance.")
+        elif action == "set_threshold":
+            # Set per-item threshold (limit is in units) using normalized key
+            state.setdefault("thresholds", {})[normalize_name(hash_name)] = limit_units
+            save_state()
+            await answer_callback(session, cq_id, f"Threshold for {hash_name} set to {limit_units/1000:.3f}$")
+            await handle_menu_command(session, TELEGRAM_CHAT_ID)
+        elif action == "clear_threshold":
+            if "thresholds" in state and normalize_name(hash_name) in state["thresholds"]:
+                state["thresholds"].pop(normalize_name(hash_name), None)
+                save_state()
+                await answer_callback(session, cq_id, f"Threshold for {hash_name} cleared.")
+            else:
+                await answer_callback(session, cq_id, "No threshold was set for this item.")
+            await handle_menu_command(session, TELEGRAM_CHAT_ID)
+        elif action == "ignore":
+            await answer_callback(session, cq_id, "Ignored.")
+    except Exception:
+        logger.exception("Error handling callback")
+
+# Обновлён poll_telegram_updates для упрощения фильтра чата
+async def poll_telegram_updates():
+    """Long-poll Telegram getUpdates to handle callback_query actions."""
+    logger.info("poll_telegram_updates starting")
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        logger.warning("Telegram token or chat id not configured; poll_telegram_updates exiting")
+        return
+
+    # Check webhook info first — if a webhook is set, getUpdates will not return updates.
+    try:
+        async with aiohttp.ClientSession() as _s:
+            wh_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getWebhookInfo"
+            async with _s.get(wh_url, timeout=5) as wh_resp:
+                wh = await wh_resp.json()
+                if wh and wh.get("ok") and wh.get("result") and wh["result"].get("url"):
+                    logger.warning("Telegram webhook is set — getUpdates may not receive callbacks. Attempting to delete webhook.")
+                    # Try to delete the webhook so getUpdates will work
+                    try:
+                        del_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
+                        async with _s.get(del_url, timeout=5) as del_resp:
+                            del_res = await del_resp.json()
+                            logger.info(f"deleteWebhook response: {del_res}")
+                    except Exception as e:
+                        logger.exception(f"Failed to delete webhook: {e}")
+                else:
+                    # Even if no webhook URL is set, the bot's allowed_updates may be restricted
+                    # (e.g., only ['callback_query']). Ensure Telegram will deliver 'message' updates
+                    # by calling setWebhook with empty URL and explicit allowed_updates.
+                    try:
+                        set_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+                        payload = {"url": "", "allowed_updates": ["message", "callback_query"]}
+                        async with _s.post(set_url, json=payload, timeout=5) as set_resp:
+                            set_res = await set_resp.json()
+                            logger.info(f"setWebhook(empty) response: {set_res}")
+                    except Exception:
+                        logger.exception("Failed to call setWebhook to ensure allowed_updates include messages")
+                # Send short diagnostic summary to Telegram to confirm poller startup
+                try:
+                    info = wh.get("result", {}) if isinstance(wh, dict) else {}
+                    url_str = info.get("url") if isinstance(info, dict) else None
+                    pending = info.get("pending_update_count") if isinstance(info, dict) else None
+                    diag = f"WebhookInfo: url={url_str}, pending_updates={pending}"
+                    await send_simple_message(_s, TELEGRAM_CHAT_ID, diag)
+                except Exception:
+                    logger.exception("Failed to send webhook diag message")
+
+                # Also perform a single getUpdates call and report result count
+                try:
+                    gu_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+                    async with _s.get(gu_url, params={"timeout": 1}, timeout=5) as gu_resp:
+                        gu = await gu_resp.json()
+                        cnt = len(gu.get("result", [])) if isinstance(gu, dict) else 0
+                        await send_simple_message(_s, TELEGRAM_CHAT_ID, f"getUpdates initial: ok={gu.get('ok')}, count={cnt}")
+                except Exception:
+                    logger.exception("Failed to fetch/send initial getUpdates diag")
+    except Exception:
+        logger.debug("Failed to fetch webhook info; proceeding with getUpdates")
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    offset = None
+    async with aiohttp.ClientSession() as tg_session:
+        logger.debug(f"poll_telegram_updates: created tg_session id={id(tg_session)} closed={getattr(tg_session,'closed',None)}")
+        while True:
+            try:
+                params = {"timeout": 20}
+                logger.debug(f"poll_telegram_updates: using tg_session id={id(tg_session)} closed={getattr(tg_session,'closed',None)} offset={offset}")
+                if offset:
+                    params["offset"] = offset
+                async with tg_session.get(url, params=params, timeout=30) as resp:
+                    data = await resp.json()
+                    # Debug: log full getUpdates response and current offset
+                    try:
+                        logger.debug(f"getUpdates response offset={offset} raw={json.dumps(data)[:4000]}")
+                    except Exception:
+                        logger.debug("getUpdates response (failed to json.dumps)")
+                    if not data.get("ok"):
+                        await asyncio.sleep(1)
+                        continue
+                    for upd in data.get("result", []):
+                        offset = upd.get("update_id") + 1
+                        logger.debug(f"Telegram update received: {json.dumps(upd)[:1000]}")
+                        cq = upd.get("callback_query")
+                        if cq:
+                            cq_id = cq.get("id")
+                            data_cd = cq.get("data")
+                            await handle_telegram_callback(data_cd, cq_id, tg_session, cq)
+                            continue
+
+                        msg = upd.get("message")
+                        if not msg:
+                            continue
+                        chat = msg.get("chat", {})
+                        chat_id_msg = str(chat.get("id"))
+                        # Log incoming message text for debugging
+                        text_msg = (msg.get("text") or "").strip()
+                        logger.debug(f"Message from chat {chat_id_msg}: {text_msg}")
+                        # Debug: log incoming chat id and awaiting_custom keys
+                        try:
+                            logger.debug(f"Incoming message chat={chat_id_msg}, text='{text_msg}' awaiting_custom_keys={list(awaiting_custom.keys())}")
+                        except Exception:
+                            logger.debug(f"Incoming message chat={chat_id_msg}, text present, awaiting_custom debug failed")
+
+                        # If this chat was awaiting a custom price (ForceReply), handle it first
+                        try:
+                            if chat_id_msg in awaiting_custom and text_msg:
+                                hash_name = awaiting_custom.pop(chat_id_msg)
+                                # parse price like 0.29 or 0,29
+                                try:
+                                    price_val = float(text_msg.replace(',', '.'))
+                                    units = int(round(price_val * 1000))
+                                    nk = normalize_name(hash_name)
+                                    state.setdefault("thresholds", {})[nk] = units
+                                    save_state()
+                                    await send_simple_message(tg_session, chat_id_msg, f"Порог для '{hash_name}' установлен: {price_val:.3f}$ ({units} units)")
+                                except Exception:
+                                    await send_simple_message(tg_session, chat_id_msg, "Неверный формат цены. Отправь, например, 0.29")
+                                continue
+                        except Exception:
+                            logger.exception("Error handling awaiting_custom reply")
+
+                        if text_msg.startswith("/menu"):
+                            logger.info(f"Invoking handle_menu_command for chat {chat_id_msg}")
+                            await handle_menu_command(tg_session, chat_id_msg)
+                        elif text_msg.startswith("/purchases"):
+                            # /purchases [N] - send whole CSV or last N records as text
+                            try:
+                                parts = text_msg.split()
+                                n = None
+                                if len(parts) > 1:
+                                    try:
+                                        n = int(parts[1])
+                                    except Exception:
+                                        n = None
+                                if not os.path.exists(PURCHASE_LOG):
+                                    await send_simple_message(tg_session, chat_id_msg, "No purchases recorded yet.")
+                                elif n is None:
+                                    await send_document(tg_session, chat_id_msg, PURCHASE_LOG, filename=os.path.basename(PURCHASE_LOG))
+                                else:
+                                    # read last N rows
+                                    rows = []
+                                    try:
+                                        with open(PURCHASE_LOG, "r", encoding="utf-8") as f:
+                                            reader = list(csv.reader(f))
+                                            if len(reader) <= 1:
+                                                await send_simple_message(tg_session, chat_id_msg, "No purchases recorded yet.")
+                                            else:
+                                                header = reader[0]
+                                                data_rows = reader[1:]
+                                                tail = data_rows[-n:]
+                                                text = ",".join(header) + "\n"
+                                                for r in tail:
+                                                    text += ",".join(str(x) for x in r) + "\n"
+                                                # Telegram messages have size limits; truncate if too long
+                                                if len(text) > 3500:
+                                                    text = text[-3500:]
+                                                await send_simple_message(tg_session, chat_id_msg, text)
+                                    except Exception:
+                                        logger.exception("Failed to read purchases CSV")
+                                        await send_simple_message(tg_session, chat_id_msg, "Failed to read purchases file.")
+                            except Exception:
+                                logger.exception("Failed to handle /purchases command")
+                                await send_simple_message(tg_session, chat_id_msg, "Failed to send purchases file.")
+                        elif text_msg.startswith("/balance"):
+                            logger.info(f"Invoking handle_balance_command for chat {chat_id_msg}")
+                            await handle_balance_command(tg_session, chat_id_msg)
+                        elif text_msg.startswith("/set"):
+                            logger.info(f"Processing /set raw: {text_msg}")
+                            # Remote set: /set "Item Name" 0.29  OR  /set Item Name 0.29 (name may contain spaces)
+                            import re
+                            # Try quoted name or single-word name first
+                            m = re.match(r'/set\s+(?:"([^"]+)"|([^\s"]+))\s+([0-9]+(?:[\.,][0-9]+)?)', text_msg)
+                            if m:
+                                item = m.group(1) or m.group(2)
+                                num = m.group(3).replace(',', '.')
+                            else:
+                                # Fallback: accept anything until last whitespace+number as item name
+                                m2 = re.match(r'/set\s+(.+)\s+([0-9]+(?:[\.,][0-9]+)?)\s*$', text_msg)
+                                if not m2:
+                                    await send_simple_message(tg_session, chat_id_msg, "Usage: /set \"Item Name\" 0.29  OR /set Item Name 0.29")
+                                    continue
+                                item = m2.group(1).strip()
+                                num = m2.group(2).replace(',', '.')
+
+                            logger.info(f"/set parsed: item='{item}' num='{num}'")
+                            try:
+                                price_val = float(num)
+                                units = int(round(price_val * 1000))
+                                nk = normalize_name(item)
+                                old = state.get("thresholds", {}).get(nk)
+                                state.setdefault("thresholds", {})[nk] = units
+                                logger.info(f"/set command: chat={chat_id_msg} item='{item}' nk='{nk}' old={old} new={units}")
+                                save_state()
+                                # get latest price if any
+                                latest = None
+                                try:
+                                    recent = state.get("recent_prices", {}).get(nk, [])
+                                    if recent:
+                                        latest = recent[-1] / 1000.0
+                                except Exception:
+                                    latest = None
+                                if latest is None:
+                                    status = "Нет данных о последней цене."
+                                else:
+                                    status = (f"Последняя цена ${latest:.3f} ≤ порог; уведомления будут срабатывать." if latest <= price_val
+                                              else f"Последняя цена ${latest:.3f} > порог; уведомления не будут до снижения цены.")
+                                await send_simple_message(tg_session, chat_id_msg, f"Порог для '{item}' установлен: {price_val:.3f}$ ({units} units). {status}\nStored key: '{nk}'")
+                            except Exception:
+                                logger.exception("Exception while processing /set")
+                                await send_simple_message(tg_session, chat_id_msg, "Не удалось установить порог. Укажите число, например 0.29")
+                        elif text_msg.startswith("/margin"):
+                            # Set floating margin percent: /margin 0.05  (5%) or /margin 5 (means 5%)
+                            try:
+                                parts = text_msg.split()
+                                if len(parts) < 2:
+                                    raise ValueError()
+                                raw = parts[1].replace(',', '.')
+                                val = float(raw)
+                                if val > 1:
+                                    val = val / 100.0
+                                state["floating_margin_pct"] = float(val)
+                                save_state()
+                                await send_simple_message(tg_session, chat_id_msg, f"Плавающая маржа установлена: {state['floating_margin_pct']:.4f} ({state['floating_margin_pct']*100:.2f}%)")
+                            except Exception:
+                                await send_simple_message(tg_session, chat_id_msg, "Usage: /margin 0.05  OR /margin 5 for 5%")
+                        elif text_msg.startswith("/show"):
+                            # Show current thresholds and margin
+                            try:
+                                thr = state.get("thresholds", {})
+                                lines = [f"{k}: {v/1000:.3f}$ ({v} units)" for k, v in thr.items()]
+                                margin = state.get("floating_margin_pct", 0.10)
+                                header = f"Floating margin: {margin} ({margin*100:.2f}%)\n"
+                                body = "\n".join(lines) if lines else "(no thresholds set)"
+                                await send_simple_message(tg_session, chat_id_msg, header + body)
+                            except Exception:
+                                await send_simple_message(tg_session, chat_id_msg, "Failed to read thresholds")
+                        elif text_msg.startswith("/history"):
+                            # Получение истории покупок через API и отправка текстового отчета (CSV)
+                            try:
+                                candidates = [
+                                    "https://market.csgo.com/api/v2/get-buy-history",
+                                    "https://market.csgo.com/api/v2/buy-history",
+                                    "https://market.csgo.com/api/v2/get-history",
+                                    "https://market.csgo.com/api/v2/history",
+                                    "https://market.csgo.com/api/v2/my/buy-history",
+                                ]
+                                all_entries = []
+                                status = None
+                                raw = None
+                                async with aiohttp.ClientSession() as _local_hist_session:
+                                    for url_hist in candidates:
+                                        try:
+                                            resp = await _local_hist_session.get(url_hist, params={"key": API_KEY}, timeout=20)
+                                            status = resp.status
+                                            raw = await resp.text()
+                                            try:
+                                                data = json.loads(raw)
+                                            except Exception:
+                                                data = None
+                                            logger.debug(f"/history tried {url_hist} status={status} snippet={raw[:500]}")
+                                            if isinstance(data, dict):
+                                                entries = data.get("items") or data.get("data") or data.get("result") or []
+                                            elif isinstance(data, list):
+                                                entries = data
+                                            else:
+                                                entries = []
+                                            if not entries:
+                                                # try to interpret raw as a JSON array
+                                                try:
+                                                    parsed = json.loads(raw)
+                                                    if isinstance(parsed, list):
+                                                        entries = parsed
+                                                except Exception:
+                                                    pass
+                                            if entries:
+                                                all_entries.extend(entries)
+                                                # try simple paging: numeric pages if total/per_page present
+                                                if isinstance(data, dict):
+                                                    total = data.get("total") or data.get("count") or data.get("size")
+                                                    per_page = data.get("per_page") or data.get("perPage") or data.get("limit") or data.get("page_size")
+                                                    if total and per_page:
+                                                        try:
+                                                            total_i = int(total)
+                                                            per_i = int(per_page)
+                                                            pages = min((total_i + per_i - 1) // per_i, 200)
+                                                        except Exception:
+                                                            pages = 1
+                                                        for p in range(2, pages + 1):
+                                                            try:
+                                                                rpage = await _local_hist_session.get(url_hist, params={"key": API_KEY, "page": p}, timeout=20)
+                                                                txt = await rpage.text()
+                                                                try:
+                                                                    dpage = json.loads(txt)
+                                                                except Exception:
+                                                                    dpage = None
+                                                                if isinstance(dpage, dict):
+                                                                    more = dpage.get("items") or dpage.get("data") or dpage.get("result") or []
+                                                                elif isinstance(dpage, list):
+                                                                    more = dpage
+                                                                else:
+                                                                    more = []
+                                                                if more:
+                                                                    all_entries.extend(more)
+                                                            except Exception:
+                                                                logger.exception(f"Failed to fetch page {p} for {url_hist}")
+                                                                break
+                                                # try following next link if present
+                                                if isinstance(data, dict):
+                                                    next_url = data.get("next") or (data.get("links") and data.get("links").get("next"))
+                                                    cur = next_url
+                                                    while cur and isinstance(cur, str):
+                                                        try:
+                                                            rnext = await _local_hist_session.get(cur, timeout=20)
+                                                            txt = await rnext.text()
+                                                            try:
+                                                                dnext = json.loads(txt)
+                                                            except Exception:
+                                                                dnext = None
+                                                            if isinstance(dnext, dict):
+                                                                more = dnext.get("items") or dnext.get("data") or dnext.get("result") or []
+                                                                if more:
+                                                                    all_entries.extend(more)
+                                                                cur = dnext.get("next") or (dnext.get("links") and dnext.get("links").get("next"))
+                                                            else:
+                                                                break
+                                                        except Exception:
+                                                            logger.exception("Failed to fetch next page for history")
+                                                            break
+                                                break
+                                        except Exception:
+                                            logger.exception(f"Error while requesting {url_hist}")
+
+                                if not all_entries:
+                                    snippet = (raw[:500] + '...') if raw else '<empty response>'
+                                    await send_simple_message(tg_session, chat_id_msg, f"История покупок недоступна (status {status}). Ответ сервера: {snippet}")
+                                    return
+
+                                # Filter to purchases only, then write to CSV and send as document
+                                purchases = [e for e in all_entries if is_purchase_entry(e)]
+                                # If heuristics missed entries but API clearly marks buys with 'event':'buy', try that as fallback
+                                if not purchases:
+                                    for e in all_entries:
+                                        try:
+                                            if isinstance(e, dict) and str(e.get('event', '')).lower() == 'buy':
+                                                purchases.append(e)
+                                        except Exception:
+                                            continue
+
+                                # If still empty, fallback to original all_entries to aid debugging
+                                write_entries = purchases if purchases else all_entries
+
+                                # Write selected entries to CSV and send as document
+                                ts = int(time.time())
+                                filename = f"purchase_history_{ts}.csv"
+                                filepath = os.path.join(os.getcwd(), filename)
+                                try:
+                                    with open(filepath, "w", encoding="utf-8", newline="") as csvf:
+                                        writer = csv.writer(csvf)
+                                        writer.writerow(["index", "detected_purchase", "name", "price_raw", "price_usd", "offer_id", "raw_json"])
+                                        for i, item in enumerate(write_entries, start=1):
+                                            try:
+                                                detected = bool((isinstance(item, dict) and (is_purchase_entry(item) or extract_price_raw(item) is not None)) or (not isinstance(item, dict) and extract_price_raw(item) is not None))
+                                                if isinstance(item, dict):
+                                                    name = item.get('market_hash_name') or item.get('name') or item.get('hash_name') or str(item.get('id', ''))
+                                                else:
+                                                    name = str(item)
+                                                raw_p = extract_price_raw(item) if isinstance(item, dict) else None
+                                                price_val = normalize_price(raw_p)
+                                                offer_id = extract_offer_id(item) if isinstance(item, dict) else None
+                                                raw_j = json.dumps(item, ensure_ascii=False)
+                                                writer.writerow([i, detected, name, raw_p if raw_p is not None else "", f"{price_val:.3f}" if price_val is not None else "", offer_id if offer_id is not None else "", raw_j])
+                                            except Exception:
+                                                writer.writerow([i, False, "<malformed>", "", "", "", ""])
+                                except Exception:
+                                    logger.exception("Failed to write purchase CSV")
+                                    await send_simple_message(tg_session, chat_id_msg, "Не удалось сохранить файл истории покупок.")
+                                    return
+
+                                try:
+                                    summary = f"Всего записей в истории: {len(all_entries)}. Обнаружено покупок по heuristics: {sum(1 for _ in all_entries if isinstance(_, dict) and (is_purchase_entry(_) or extract_price_raw(_) is not None))}. Файл с полной историей отправлен."
+                                    await send_simple_message(tg_session, chat_id_msg, summary)
+                                    await send_document(tg_session, chat_id_msg, filepath, filename=filename)
+                                except Exception:
+                                    logger.exception("Failed to send history file")
+                                    await send_simple_message(tg_session, chat_id_msg, "Ошибка при отправке файла истории покупок.")
+                            except Exception:
+                                logger.exception("Ошибка при обработке команды /history")
+                                try:
+                                    await send_simple_message(tg_session, chat_id_msg, "Произошла ошибка при получении истории покупок.")
+                                except Exception:
+                                    logger.exception("Failed to notify user about /history error")
+            except Exception as e:
+                logger.exception("poll_telegram_updates exception")
+                await asyncio.sleep(1)
+
+
+async def answer_callback(session, callback_query_id, text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+    try:
+        async with session.post(url, json={"callback_query_id": callback_query_id, "text": text, "show_alert": False}) as r:
+            return await r.json()
+    except Exception as e:
+        logger.error(f"Failed to answer callback: {e}")
+
+
+async def periodic_processed_cleanup():
+    """Background task to periodically cleanup processed_ids."""
+    while True:
+        try:
+            cleanup_processed_ids()
+        except Exception:
+            logger.exception("Error in periodic_processed_cleanup")
+        await asyncio.sleep(PROCESSED_TTL // 2)
+
+
+async def send_simple_message(session, chat_id, text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        try:
+            sess_id = id(session)
+            sess_closed = getattr(session, 'closed', None)
+        except Exception:
+            sess_id = None
+            sess_closed = None
+        payload = {"chat_id": chat_id, "text": text}
+        masked = (TELEGRAM_BOT_TOKEN[:6] + "..." + TELEGRAM_BOT_TOKEN[-6:]) if TELEGRAM_BOT_TOKEN else "<no-token>"
+        logger.debug(f"send_simple_message -> URL={url} token={masked} payload_keys={list(payload.keys())} session_id={sess_id} session_closed={sess_closed}")
+        async with session.post(url, json=payload) as r:
+            body = await r.text()
+            if r.status != 200:
+                logger.error(f"send_simple_message failed: {r.status} {body}")
+            else:
+                logger.debug(f"send_simple_message ok: {body[:200]}")
+            try:
+                return json.loads(body)
+            except Exception:
+                return {"ok": False, "raw": body}
+    except Exception as e:
+        logger.error(f"Failed to send simple message: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+async def send_document(session, chat_id, file_path, filename=None):
+    """Send a file to Telegram chat via sendDocument."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+    try:
+        fname = filename or os.path.basename(file_path)
+        with open(file_path, "rb") as f:
+            data = aiohttp.FormData()
+            data.add_field("chat_id", str(chat_id))
+            data.add_field("document", f, filename=fname, content_type="application/octet-stream")
+            async with session.post(url, data=data, timeout=60) as resp:
+                body = await resp.text()
+                if resp.status != 200:
+                    logger.error(f"send_document failed: {resp.status} {body}")
+                else:
+                    logger.debug(f"send_document ok: {body[:200]}")
+                try:
+                    return json.loads(body)
+                except Exception:
+                    return {"ok": False, "raw": body}
+    except Exception:
+        logger.exception("Failed to send document")
+        return {"ok": False, "error": "exception"}
+
+async def get_balance():
+    """Fetch balance from the API."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://market.csgo.com/api/v2/get-money", params={"key": API_KEY}) as response:
+                data = await response.json()
+                if data.get("success"):
+                    # API returns money as USD float (e.g. 18.191)
+                    balance = float(data.get("money", 0))
+                    logger.info(f"Current balance: ${balance}")
+                    return balance
+                else:
+                    logger.error(f"Failed to fetch balance: {data}")
+                    return 0
+    except Exception as e:
+        logger.exception(f"Error fetching balance: {e}")
+        return 0
+
+# Функция для переключения режима и обработки команды /menu
+async def handle_menu_command(session, chat_id):
+    """Send menu with mode switching buttons."""
+    try:
+        mode = state.get("mode", "MANUAL")
+        # Mode toggle buttons (also provide a single toggle button)
+        mode_buttons = [
+            {"text": f"Mode: AUTO {'✅' if mode == 'AUTO' else ''}", "callback_data": "set_mode:AUTO"},
+            {"text": f"Mode: MANUAL {'✅' if mode == 'MANUAL' else ''}", "callback_data": "set_mode:MANUAL"}
+        ]
+        toggle_text = "Enable AUTO" if mode != "AUTO" else "Disable AUTO"
+        toggle_button = [{"text": toggle_text, "callback_data": "toggle_mode"}]
+
+        # Per-target: do not show preset price buttons or threshold labels; only provide Custom and Clear
+        keyboard = [mode_buttons, toggle_button]
+        for t in TARGET_MARKET_HASHES:
+            row = []
+            # Provide Clear and Custom input button only
+            row.append({"text": "Clear", "callback_data": f"clear_threshold|{urllib.parse.quote_plus(t)}|0"})
+            row.append({"text": "Custom", "callback_data": f"set_custom|{urllib.parse.quote_plus(t)}|0"})
+            keyboard.append(row)
+
+        reply_markup = {"inline_keyboard": keyboard}
+        # Build payload that includes a descriptive text plus reply_markup
+        payload = {"chat_id": chat_id, "text": "Select mode and per-item thresholds:", "reply_markup": json.dumps(reply_markup)}
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        async with session.post(url, json=payload) as resp:
+            if resp.status != 200:
+                logger.error(f"Failed to send menu: {resp.status} {await resp.text()}")
+    except Exception:
+        logger.exception("Failed to handle /menu command")
+
+# Обновлённая функция для обработки команды /balance
+async def handle_balance_command(session, chat_id):
+    """Fetch and send balance information."""
+    try:
+        # Request detailed balance info
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://market.csgo.com/api/v2/get-money", params={"key": API_KEY}) as resp:
+                data = await resp.json()
+                logger.debug(f"get-money response for /balance: {data}")
+                if data.get("success"):
+                    money = float(data.get("money", 0))
+                    money_settlement = data.get("money_settlement")
+                    text = f"Balance: ${money:.3f} USD"
+                    if money_settlement is not None:
+                        try:
+                            text += f"\nSettlement: ${float(money_settlement):.3f} USD"
+                        except Exception:
+                            text += f"\nSettlement: {money_settlement}"
+                else:
+                    text = "Failed to fetch balance."
+        await send_simple_message(session, chat_id, text)
+    except Exception:
+        logger.exception("Error fetching balance")
+        await send_simple_message(session, chat_id, "Error fetching balance.")
+
+# Функция для проверки баланса
+async def check_balance():
+    """Check the current balance, fetching from the API if necessary."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://market.csgo.com/api/v2/get-money", params={"key": API_KEY}) as response:
+                data = await response.json()
+                if data.get("success"):
+                    # API returns money as USD float
+                    return float(data.get("money", 0))
+                else:
+                    logger.error(f"Failed to fetch balance: {data}")
+                    return 0
+    except Exception as e:
+        logger.exception(f"Error fetching balance: {e}")
+        return 0
+
+# Функция для выполнения покупки с проверкой баланса
+async def buy_item_with_balance_check(hash_name: str, price: int):
+    """Check balance before attempting to buy an item."""
+    try:
+        balance = await check_balance()
+        if balance >= price / 1000:
+            # Check spend limits
+            allowed, reason = can_spend(price / 1000.0)
+            if not allowed:
+                logger.warning(f"Purchase blocked by limits: {reason}")
+                return
+            success, result = await buy_item(hash_name, price, source="balance_check")
+            if success:
+                logger.info(f"Purchase successful: {result}")
+            else:
+                logger.error(f"Purchase failed: {result}")
+        else:
+            logger.warning("Insufficient balance for purchase.")
+    except Exception:
+        logger.exception("Error during purchase with balance check.")
+
+# Функция для выполнения покупки
+async def buy_cheapest_by_hash_name(hash_name, threshold_units):
+    """Attempt to buy the cheapest lot by hash_name and price limit."""
+    try:
+        # reuse buy_item which handles logging and recording
+        ok, res = await buy_item(hash_name, threshold_units, source="auto")
+        if ok:
+            return True, "Purchase successful."
+        return False, res
+    except Exception:
+        logger.exception("Error during purchase")
+        return False, "Error during purchase."
+
+async def buy_item(hash_name: str, price: int, source: str = "manual", raw=None):
+    """Покупка предмета через API market.csgo.com."""
+    # Safety: do not allow automatic-source purchases when mode is not AUTO
+    try:
+        current_mode = state.get("mode", "MANUAL")
+    except Exception:
+        current_mode = "MANUAL"
+    logger.debug(f"buy_item called: name={hash_name} price={price} source={source} mode={current_mode}")
+    if source == "auto" and current_mode != "AUTO":
+        logger.warning(f"Blocked auto purchase for {hash_name} because mode={current_mode}")
+        return False, "blocked: manual mode"
+    url = f"https://market.csgo.com/api/v2/buy"
+    params = {
+        "key": API_KEY,
+        "hash_name": hash_name,
+        "price": price
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as response:
+                data = await response.json()
+                if data.get("success"):
+                    logger.info(f"Successfully bought {hash_name} for {price / 1000:.2f} USD")
+                    try:
+                        record_purchase(hash_name, price, offer_id=data.get("id"), raw=raw, source=source)
+                        # Send short Telegram summary about recorded purchase
+                        try:
+                            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                                await send_simple_message(session, TELEGRAM_CHAT_ID, f"Purchase recorded: {hash_name} for ${price/1000:.3f} (id: {data.get('id')})")
+                        except Exception:
+                            logger.exception("Failed to send purchase summary message")
+                    except Exception:
+                        logger.exception("Failed recording purchase after buy")
+                    return True, data.get("id")
+                else:
+                    logger.error(f"Failed to buy {hash_name}: {data}")
+                    return False, data.get("error")
+    except Exception as e:
+        logger.exception("Error during purchase")
+        return False, str(e)
+
+# Добавлено определение функции process_item
+
+def process_item(item):
+    """Process an item from REST API response."""
+    try:
+        name = item.get("market_hash_name") or item.get("name")
+        if not name:
+            return
+
+        if TARGET_NAME_ID:
+            if item.get("name_id") != TARGET_NAME_ID:
+                return
+        else:
+            if not any(t.lower() in name.lower() for t in TARGET_MARKET_HASHES):
+                return
+
+        raw_price = item.get("price") or item.get("value")
+        if raw_price is None:
+            return
+        try:
+            price_float = float(raw_price)
+        except Exception:
+            return
+
+        # Determine effective threshold per-item (units) using recent prices (floating)
+        price_units = int(price_float * 1000)
+        norm = normalize_name(name)
+        recent = state.setdefault("recent_prices", {}).setdefault(norm, [])
+        recent.append(price_units)
+        if len(recent) > 20:
+            recent[:] = recent[-20:]
+        try:
+            sorted_recent = sorted(recent)
+            mid = len(sorted_recent) // 2
+            if len(sorted_recent) % 2 == 1:
+                baseline = sorted_recent[mid]
+            else:
+                baseline = (sorted_recent[mid - 1] + sorted_recent[mid]) // 2
+        except Exception:
+            baseline = THRESHOLD
+        floating_margin = float(state.get("floating_margin_pct", 0.10))
+        cfg_threshold = state.get("thresholds", {}).get(norm)
+        try:
+            if cfg_threshold is not None:
+                effective_threshold_units = int(cfg_threshold)
+            else:
+                effective_threshold_units = int(baseline * (1.0 - floating_margin))
+        except Exception:
+            effective_threshold_units = THRESHOLD
+        logger.debug(f"REST check for '{name}': price_units={price_units}, effective_threshold_units={effective_threshold_units}, cfg_threshold={cfg_threshold}, baseline={baseline}, floating_margin={floating_margin}, norm={norm}")
+        if price_units > effective_threshold_units:
+            logger.debug(f"Skipping REST item '{name}': price {price_units} > threshold {effective_threshold_units}")
+            save_state()
+            return
+
+        # If AUTO mode is enabled, aggregate offers for debounced buy; otherwise notify
+        if state.get("mode") == "AUTO":
+            enqueue_pending_auto(name, price_units, threshold_units=effective_threshold_units, raw=item)
+        else:
+            asyncio.create_task(notify_telegram({"source": "rest", "name": name, "price": price_float, "raw": item}))
+    except Exception:
+        logger.exception("Error processing REST item")
+
+# Добавлено определение функции notify_telegram
+
+async def notify_telegram(data):
+    """Schedule Telegram notification (non-blocking)."""
+    name = data.get("name") or data.get("market_hash_name") or "<unknown>"
+    price = data.get("price")
+    source = data.get("source", "unknown")
+
+    # Generate alert_id
+    alert_id = data.get("lot_key") or str(uuid.uuid4())
+
+    # Determine recommendation
+    try:
+        price_units = int(float(price) * 1000)
+        balance = await check_balance()
+        if price_units <= THRESHOLD and balance >= price_units / 1000:
+            recommendation = "BUY"
+        else:
+            recommendation = "DO NOT BUY"
+    except Exception:
+        price_units = None
+        recommendation = "unknown"
+
+    text = f"{name}\nprice: ${price} ({price_units or 'N/A'} units)\nrecommendation: {recommendation}\nsource: {source}"
+
+    logger.info(f"[Telegram] Item matched: name={name}, price={price}, recommendation={recommendation}")
+
+    # Include alert_id in the message
+    text = f"{text}\nalert_id: {alert_id}\nfilter_by_name_id: {bool(TARGET_NAME_ID)}"
+
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        include_buttons = False if source == "auto" else True
+        asyncio.create_task(send_telegram(text, name, alert_id, price_units, include_buttons=include_buttons))
+    else:
+        # If Telegram not configured, just print the message
+        print(text)
+
+# Добавлено определение функции send_telegram
+async def send_telegram(text: str, name: str, alert_id: str, price_units: int, include_buttons: bool = True):
+    """Send message via Telegram bot API (async) with optional inline buttons.
+
+    When `include_buttons` is False (e.g. for AUTO notifications) only the "Open on Market"
+    button will be sent to avoid presenting Confirm/Ignore actions.
+    """
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    market_url = build_market_search_url(name)
+    if include_buttons:
+        reply_markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "Open on Market", "url": market_url}
+                ],
+                [
+                    {"text": "Confirm Buy", "callback_data": f"confirm_buy|{urllib.parse.quote_plus(name)}|{price_units}"},
+                    {"text": "Ignore", "callback_data": f"ignore|{urllib.parse.quote_plus(name)}|{price_units}"}
+                ]
+            ]
+        }
+    else:
+        reply_markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "Open on Market", "url": market_url}
+                ]
+            ]
+        }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "reply_markup": json.dumps(reply_markup)}
+    try:
+        masked = (TELEGRAM_BOT_TOKEN[:6] + "..." + TELEGRAM_BOT_TOKEN[-6:]) if TELEGRAM_BOT_TOKEN else "<no-token>"
+        logger.debug(f"send_telegram -> URL={url} token={masked} chat_id={TELEGRAM_CHAT_ID} payload_keys={list(payload.keys())}")
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=10) as resp:
+                body = await resp.text()
+                if resp.status != 200:
+                    logger.error(f"Telegram send failed: {resp.status} {body}")
+                else:
+                    if DEBUG_MODE:
+                        logger.debug(f"Telegram message sent: {body[:200]}")
+    except Exception as e:
+        logger.exception(f"Failed to send Telegram message: {e}")
+
+def build_market_search_url(name: str) -> str:
+    """Generate a URL to search the market for a given item name."""
+    base_url = "https://market.csgo.com/"
+    query = urllib.parse.quote_plus(name)
+    return f"{base_url}search?q={query}"
+
+if __name__ == "__main__":
+    # Run an aiohttp web server with /ping for health checks and run websocket_listener in background
+    async def _on_startup(app):
+        logger.info("Starting background websocket listener task")
+        app['ws_task'] = asyncio.create_task(websocket_listener())
+
+    async def _on_cleanup(app):
+        # Cancel background task
+        task = app.get('ws_task')
+        if task:
+            try:
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=5)
+                except asyncio.CancelledError:
+                    pass
+                except asyncio.TimeoutError:
+                    logger.warning("ws_task did not exit within timeout during cleanup")
+            except Exception:
+                logger.exception("Error cancelling ws_task during cleanup")
+        # Close global aiohttp session if any
+        await close_session()
+
+    app = web.Application()
+    app.router.add_get('/ping', lambda request: web.Response(text='pong'))
+    app.on_startup.append(_on_startup)
+    app.on_cleanup.append(_on_cleanup)
+
+    port = int(os.getenv('PORT', '8000'))
+    logger.info(f"Starting webserver on 0.0.0.0:{port}, /ping endpoint available")
+    try:
+        web.run_app(app, host='0.0.0.0', port=port)
+    except KeyboardInterrupt:
+        logger.info("Program terminated by user.")

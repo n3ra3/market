@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtualenv
+.venv/
+env/
+venv/
+
+# Local env files and secrets
+.env
+.env.local
+.env.*.local
+.env.*
+
+# Application state and logs
+state.json
+state.json.debug
+processed_ids.json
+purchase_history.csv
+*.log
+
+# IDE
+.vscode/
