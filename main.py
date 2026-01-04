@@ -18,7 +18,7 @@ DEBUG_MODE = os.getenv("MARKET_DEBUG", "1") in ("1", "true", "True")
 # You can target either by name_id (if using names.json / WS events) or by market_hash_name
 TARGET_NAME_ID = None  # Example: "12345" or None
 # Support multiple targets (comma-separated env var) e.g. "Sealed Genesis Terminal,Recoil Case"
-_targets_env = os.getenv("TARGET_MARKET_HASH_NAME", "Sealed Genesis Terminal")
+_targets_env = os.getenv("TARGET_MARKET_HASH_NAME", "Sealed Genesis Terminal,Fracture Case")
 TARGET_MARKET_HASHES = [t.strip() for t in _targets_env.split(",") if t.strip()]
 # THRESHOLD: units where 1 USD = 1000 (so 1000 = $1.00). Compare against price * 1000
 THRESHOLD = 290  # Notify if price is below this value
