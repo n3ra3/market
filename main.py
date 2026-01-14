@@ -54,13 +54,17 @@ WS_ORIGIN = os.getenv("WS_ORIGIN", "https://market.csgo.com")
 WS_USER_AGENT = os.getenv("WS_USER_AGENT", "market-bot/1.0")
 # Optional proxy configuration removed — proxies disabled by default
 # (If you later want proxies, set HTTP_PROXY or WS_PROXY and re-enable support.)
-# Fallback polling interval in seconds (default 10)
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))
-# Dedupe bucket size in seconds (used to group similar alerts). Default 120 (2 minutes)
-DEDUPE_BUCKET_SEC = int(os.getenv("DEDUPE_BUCKET_SEC", "120"))
-# Debounce window (seconds) to aggregate multiple near-simultaneous offers for same item
-DEBOUNCE_SEC = int(os.getenv("DEBOUNCE_SEC", "3"))
-# Maximum number of lots to buy in one aggregated AUTO window (0 = disabled)
+# Fallback polling interval in seconds (default 10). Lower -> more REST requests.
+# You can override via environment variable `POLL_INTERVAL` on Render.
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
+# Dedupe bucket size in seconds (used to group similar alerts). Default 120 (2 minutes).
+# Lowering this reduces grouping window so similar-priced alerts are treated sooner.
+DEDUPE_BUCKET_SEC = int(os.getenv("DEDUPE_BUCKET_SEC", "60"))
+# Debounce window (seconds) to aggregate multiple near-simultaneous offers for same item.
+# Lower -> attempt buys faster for single events. Default reduced to 1.
+DEBOUNCE_SEC = int(os.getenv("DEBOUNCE_SEC", "1"))
+# Maximum number of lots to buy in one aggregated AUTO window (0 = disabled).
+# Set >0 to allow small batch purchases when many offers appear simultaneously.
 MAX_BATCH_BUY = int(os.getenv("MAX_BATCH_BUY", "0"))
 # Purchase log and spend limits
 PURCHASE_LOG = os.path.join(os.getcwd(), "purchase_history.csv")
@@ -770,10 +774,25 @@ async def debounced_auto_buy(key: str):
                 break
             target_offer = offers_now[i] if i < len(offers_now) else cheapest
             tgt_price = int(target_offer.get("price_units", price_units))
+
+            # Re-check real balance before attempting each purchase to avoid "Not money" races
+            try:
+                current_balance = await check_balance()
+            except Exception:
+                current_balance = 0
+            if current_balance < (tgt_price / 1000.0):
+                logger.warning(f"Batch buy stopped: insufficient balance for next lot. needed={tgt_price/1000.0:.3f}, balance={current_balance:.3f}")
+                last_err = f"insufficient_balance:{current_balance}"
+                break
+
+            # Check spend limits stored in state
             allowed, reason = can_spend(tgt_price / 1000.0)
             if not allowed:
                 logger.warning(f"Batch buy stopped by spend limits: {reason}")
+                last_err = reason
                 break
+
+            # Attempt purchase
             ok, res = await buy_item(name, tgt_price, source="auto", raw=target_offer.get("raw") if isinstance(target_offer, dict) else None)
             if ok:
                 bought_count += 1
@@ -781,6 +800,11 @@ async def debounced_auto_buy(key: str):
                     purchases_made.append({"price_units": tgt_price, "id": res, "ts": int(time.time())})
                 except Exception:
                     purchases_made.append({"price_units": tgt_price, "id": res})
+                # Small delay between successive buys to reduce race with other buyers/provider throttling
+                try:
+                    await asyncio.sleep(0.4)
+                except Exception:
+                    pass
             else:
                 last_err = res
                 logger.warning(f"Batch buy attempt failed for {name} at {tgt_price/1000.0:.3f}: {res}")
@@ -1741,31 +1765,53 @@ async def buy_item(hash_name: str, price: int, source: str = "manual", raw=None)
         logger.warning(f"Blocked auto purchase for {hash_name} because mode={current_mode}")
         return False, "blocked: manual mode"
     url = f"https://market.csgo.com/api/v2/buy"
-    params = {
-        "key": API_KEY,
-        "hash_name": hash_name,
-        "price": price
-    }
+    params = {"key": API_KEY, "hash_name": hash_name, "price": price}
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as response:
-                data = await response.json()
-                if data.get("success"):
-                    logger.info(f"Successfully bought {hash_name} for {price / 1000:.2f} USD")
+        # Reuse global session to reduce overhead and keep cookies/headers consistent
+        await init_session()
+        s = session
+        headers = {"User-Agent": WS_USER_AGENT, "Origin": WS_ORIGIN}
+        async with s.get(url, params=params, headers=headers, timeout=15) as response:
+            content_type = response.headers.get("Content-Type", "")
+            text = await response.text()
+            # If server returned HTML (e.g., rate-limit page or captcha), log full text for debugging
+            if "application/json" not in content_type:
+                logger.error(f"Buy endpoint returned non-JSON content-type: {content_type}; body={text[:1000]}")
+                # Try to surface useful message
+                return False, f"unexpected content-type {content_type}: {text[:200]}"
+
+            try:
+                data = json.loads(text)
+            except Exception:
+                logger.error(f"Failed to parse JSON from buy response: {text[:1000]}")
+                return False, "invalid-json-response"
+
+            if data.get("success"):
+                logger.info(f"Successfully bought {hash_name} for {price / 1000:.2f} USD")
+                try:
+                    record_purchase(hash_name, price, offer_id=data.get("id"), raw=raw, source=source)
                     try:
-                        record_purchase(hash_name, price, offer_id=data.get("id"), raw=raw, source=source)
-                        # Send short Telegram summary about recorded purchase
-                        try:
-                            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                                await send_simple_message(session, TELEGRAM_CHAT_ID, f"Purchase recorded: {hash_name} for ${price/1000:.3f} (id: {data.get('id')})")
-                        except Exception:
-                            logger.exception("Failed to send purchase summary message")
+                        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                            await send_simple_message(s, TELEGRAM_CHAT_ID, f"Purchase recorded: {hash_name} for ${price/1000:.3f} (id: {data.get('id')})")
                     except Exception:
-                        logger.exception("Failed recording purchase after buy")
-                    return True, data.get("id")
-                else:
-                    logger.error(f"Failed to buy {hash_name}: {data}")
-                    return False, data.get("error")
+                        logger.exception("Failed to send purchase summary message")
+                except Exception:
+                    logger.exception("Failed recording purchase after buy")
+                return True, data.get("id")
+
+            # Not success
+            err = data.get("error") or data
+            logger.error(f"Failed to buy {hash_name}: {err}")
+            # If provider says Not money, re-check balance to log real balance and avoid blind retries
+            if isinstance(err, str) and "Not money" in err:
+                try:
+                    bal = await check_balance()
+                    logger.warning(f"Buy failed due to Not money; balance reported: {bal}")
+                    return False, f"Not money; balance={bal}"
+                except Exception:
+                    return False, "Not money"
+
+            return False, err
     except Exception as e:
         logger.exception("Error during purchase")
         return False, str(e)
