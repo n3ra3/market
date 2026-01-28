@@ -13,7 +13,8 @@ import os
 import uuid
 
 # Configuration
-API_KEY = os.getenv("MARKET_API_KEY", "XDJGP3iT8cUj3sC2vsAbBiEh8iqc6Zx")  # Replace with your API key or set env MARKET_API_KEY
+# Require MARKET_API_KEY from environment. Do NOT keep a hardcoded API key here.
+API_KEY = os.getenv("MARKET_API_KEY")  # must be set in environment
 DEBUG_MODE = os.getenv("MARKET_DEBUG", "1") in ("1", "true", "True")
 # You can target either by name_id (if using names.json / WS events) or by market_hash_name
 TARGET_NAME_ID = None  # Example: "12345" or None
@@ -80,6 +81,12 @@ if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
     logger.info("Telegram configured: yes")
 else:
     logger.info("Telegram configured: no (messages will be printed)")
+
+# Fail fast when API key is not provided — enforce env var usage so deployments
+# (e.g., Render) must supply `MARKET_API_KEY` and no secret remains in code.
+if not API_KEY:
+    logger.error("No MARKET_API_KEY provided. Set environment variable MARKET_API_KEY before starting the service.")
+    raise SystemExit(1)
 
 # Persistent state for confirmed/ignored items
 STATE_FILE = os.path.join(os.getcwd(), "state.json")
