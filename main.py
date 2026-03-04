@@ -19,7 +19,7 @@ DEBUG_MODE = os.getenv("MARKET_DEBUG", "1") in ("1", "true", "True")
 # You can target either by name_id (if using names.json / WS events) or by market_hash_name
 TARGET_NAME_ID = None  # Example: "12345" or None
 # Support multiple targets (comma-separated env var) e.g. "Sealed Genesis Terminal,Recoil Case"
-_targets_env = os.getenv("TARGET_MARKET_HASH_NAME", "Sealed Genesis Terminal,Fracture Case")
+_targets_env = os.getenv("TARGET_MARKET_HASH_NAME", "Sealed Genesis Terminal")
 TARGET_MARKET_HASHES = [t.strip() for t in _targets_env.split(",") if t.strip()]
 # THRESHOLD: units where 1 USD = 1000 (so 1000 = $1.00). Compare against price * 1000
 THRESHOLD = 290  # Notify if price is below this value
@@ -693,14 +693,6 @@ async def fallback_polling():
 
         await asyncio.sleep(POLL_INTERVAL)
 
-def find_cheapest_lot(items):
-    """Find the cheapest lot from a list of items."""
-    try:
-        return min(items, key=lambda x: float(x.get("price", float("inf"))))
-    except Exception:
-        logger.exception("Failed to find the cheapest lot.")
-        return None
-
 # Temporary storage for pending offers
 pending_offers = {}
 
@@ -727,6 +719,8 @@ def enqueue_pending_auto(name: str, price_units: int, threshold_units: int = Non
 
 async def debounced_auto_buy(key: str):
     """Wait DEBOUNCE_SEC seconds and attempt a single purchase for aggregated offers keyed by name|bucket."""
+    start_time = time.time()
+    logger.info(f"Debounced auto-buy started for key={key} at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}")
     try:
         await asyncio.sleep(DEBOUNCE_SEC)
         entry = pending_offers.pop(key, None)
@@ -866,11 +860,16 @@ async def debounced_auto_buy(key: str):
                 logger.exception("Failed to send debounced AUTO failure message")
     except Exception:
         logger.exception("Error in debounced_auto_buy")
+    finally:
+        end_time = time.time()
+        logger.info(f"Debounced auto-buy ended for key={key} at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}")
+        logger.info(f"Debounced auto-buy duration: {end_time - start_time:.2f} seconds")
 
 
 async def fetch_available_offers(name: str, max_price_units: int):
     """Fetch current REST listings and return list of offers for `name` with price_units <= max_price_units.
     Returns list of dicts with keys including 'price_units' and 'raw'."""
+    start_time = time.time()
     try:
         await init_session()
         s = session
@@ -904,6 +903,9 @@ async def fetch_available_offers(name: str, max_price_units: int):
     except Exception:
         logger.exception("Failed to fetch available offers")
         return []
+    finally:
+        end_time = time.time()
+        logger.info(f"fetch_available_offers duration: {end_time - start_time:.2f} seconds")
 
 # Update process_event to handle the cheapest lot logic
 def process_event(event):
