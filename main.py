@@ -57,13 +57,13 @@ WS_USER_AGENT = os.getenv("WS_USER_AGENT", "market-bot/1.0")
 # (If you later want proxies, set HTTP_PROXY or WS_PROXY and re-enable support.)
 # Fallback polling interval in seconds (default 10). Lower -> more REST requests.
 # You can override via environment variable `POLL_INTERVAL` on Render.
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "2"))  # Updated to 2 seconds for safe API usage
 # Dedupe bucket size in seconds (used to group similar alerts). Default 120 (2 minutes).
 # Lowering this reduces grouping window so similar-priced alerts are treated sooner.
 DEDUPE_BUCKET_SEC = int(os.getenv("DEDUPE_BUCKET_SEC", "60"))
 # Debounce window (seconds) to aggregate multiple near-simultaneous offers for same item.
 # Lower -> attempt buys faster for single events. Default reduced to 1.
-DEBOUNCE_SEC = int(os.getenv("DEBOUNCE_SEC", "1"))
+DEBOUNCE_SEC = float(os.getenv("DEBOUNCE_SEC", "0.3"))  # Updated to 0.3 seconds for safe API usage
 # Maximum number of lots to buy in one aggregated AUTO window (0 = disabled).
 # Set >0 to allow small batch purchases when many offers appear simultaneously.
 MAX_BATCH_BUY = int(os.getenv("MAX_BATCH_BUY", "0"))
