@@ -8,26 +8,35 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 import asyncio
 import aiohttp
-import importlib.util
 import os
-# Load config by path to avoid import conflicts
-TELEGRAM_TOKEN = None
-CHAT_ID = None
-try:
-    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.py")
-    if os.path.exists(cfg_path):
-        spec = importlib.util.spec_from_file_location("bot_config", cfg_path)
-        cfg = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cfg)
-        TELEGRAM_TOKEN = getattr(cfg, "TELEGRAM_TOKEN", None)
-        CHAT_ID = getattr(cfg, "CHAT_ID", None)
-    else:
-        # fallback to environment
-        TELEGRAM_TOKEN = os.getenv("MARKET_TELEGRAM_TOKEN")
-        CHAT_ID = os.getenv("MARKET_TELEGRAM_CHAT_ID")
-except Exception:
-    TELEGRAM_TOKEN = os.getenv("MARKET_TELEGRAM_TOKEN")
-    CHAT_ID = os.getenv("MARKET_TELEGRAM_CHAT_ID")
+
+
+def load_dotenv_file(env_path):
+    """Load .env values without overriding real environment variables."""
+    try:
+        if not os.path.exists(env_path):
+            return
+        with open(env_path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if not key:
+                    continue
+                if len(value) >= 2 and ((value[0] == '"' and value[-1] == '"') or (value[0] == "'" and value[-1] == "'")):
+                    value = value[1:-1]
+                os.environ.setdefault(key, value)
+    except Exception:
+        pass
+
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv_file(os.path.join(PROJECT_ROOT, ".env"))
+TELEGRAM_TOKEN = os.getenv("MARKET_TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("MARKET_TELEGRAM_CHAT_ID")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()

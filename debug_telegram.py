@@ -1,12 +1,34 @@
 import json
 import sys
 import os
-# Ensure project root is on sys.path so `bot` package is importable
-sys.path.insert(0, os.getcwd())
-try:
-    from bot.config import TELEGRAM_TOKEN, CHAT_ID
-except Exception as e:
-    print('Failed to import bot.config:', e)
+
+
+def load_dotenv_file(env_path):
+    try:
+        if not os.path.exists(env_path):
+            return
+        with open(env_path, 'r', encoding='utf-8') as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip()
+                if not key:
+                    continue
+                if len(value) >= 2 and ((value[0] == '"' and value[-1] == '"') or (value[0] == "'" and value[-1] == "'")):
+                    value = value[1:-1]
+                os.environ.setdefault(key, value)
+    except Exception as e:
+        print('Failed to load .env:', e)
+
+
+load_dotenv_file(os.path.join(os.getcwd(), '.env'))
+TELEGRAM_TOKEN = os.getenv('MARKET_TELEGRAM_TOKEN')
+CHAT_ID = os.getenv('MARKET_TELEGRAM_CHAT_ID')
+if not TELEGRAM_TOKEN or not CHAT_ID:
+    print('Missing MARKET_TELEGRAM_TOKEN or MARKET_TELEGRAM_CHAT_ID in env/.env')
     sys.exit(1)
 try:
     import requests

@@ -12,6 +12,33 @@ import logging
 import os
 import uuid
 
+
+def load_dotenv_file(env_path: str = ".env"):
+    """Load KEY=VALUE pairs from .env into os.environ without overriding existing env vars."""
+    try:
+        if not os.path.exists(env_path):
+            return
+        with open(env_path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if not key:
+                    continue
+                # Remove optional wrapping quotes.
+                if len(value) >= 2 and ((value[0] == '"' and value[-1] == '"') or (value[0] == "'" and value[-1] == "'")):
+                    value = value[1:-1]
+                os.environ.setdefault(key, value)
+    except Exception:
+        # Keep startup resilient even if .env has malformed lines.
+        pass
+
+
+load_dotenv_file(os.path.join(os.getcwd(), ".env"))
+
 # Configuration
 # Require MARKET_API_KEY from environment. Do NOT keep a hardcoded API key here.
 API_KEY = os.getenv("MARKET_API_KEY")  # must be set in environment
@@ -21,33 +48,24 @@ TARGET_NAME_ID = None  # Example: "12345" or None
 # Support multiple targets (comma-separated env var) e.g. "Sealed Genesis Terminal,Recoil Case"
 _targets_env = os.getenv("TARGET_MARKET_HASH_NAME", "Sealed Genesis Terminal")
 TARGET_MARKET_HASHES = [t.strip() for t in _targets_env.split(",") if t.strip()]
-# THRESHOLD: units where 1 USD = 1000 (so 1000 = $1.00). Compare against price * 1000
-THRESHOLD = 290  # Notify if price is below this value
+# Default threshold from env (USD) -> units where 1 USD = 1000.
+DEFAULT_THRESHOLD_USD = float(os.getenv("DEFAULT_THRESHOLD_USD", "0.29"))
+THRESHOLD = int(round(DEFAULT_THRESHOLD_USD * 1000))
+# Hard safety cap from env (USD). If 0, cap is disabled.
+HARD_MAX_BUY_PRICE_USD = float(os.getenv("HARD_MAX_BUY_PRICE_USD", "0"))
+HARD_MAX_BUY_UNITS = int(round(HARD_MAX_BUY_PRICE_USD * 1000)) if HARD_MAX_BUY_PRICE_USD > 0 else 0
+# Startup safety controls.
+REQUIRE_EXPLICIT_THRESHOLD = os.getenv("REQUIRE_EXPLICIT_THRESHOLD", "1") in ("1", "true", "True", "yes", "on")
+RESET_THRESHOLDS_ON_START = os.getenv("RESET_THRESHOLDS_ON_START", "1") in ("1", "true", "True", "yes", "on")
+RESET_MODE_ON_START = os.getenv("RESET_MODE_ON_START", "1") in ("1", "true", "True", "yes", "on")
+SAFE_START_THRESHOLD_USD = float(os.getenv("SAFE_START_THRESHOLD_USD", "0"))
+SAFE_START_THRESHOLD_UNITS = int(round(SAFE_START_THRESHOLD_USD * 1000)) if SAFE_START_THRESHOLD_USD > 0 else 0
 # How to apply ignore: 'id' = prefer listing id (default), 'name' = ignore by market_hash_name
 IGNORE_BY = os.getenv("IGNORE_BY", "id")  # 'id' or 'name'
 
-# Telegram settings (optional). You can set env MARKET_TELEGRAM_TOKEN and MARKET_TELEGRAM_CHAT_ID
-# Fallback to bot/config.py values if environment variables are not set.
-# Load by file path to avoid import conflicts with installed modules named 'bot'.
-bot_config = None
-try:
-    config_path = os.path.join(os.getcwd(), "bot", "config.py")
-    if os.path.exists(config_path):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("bot_config", config_path)
-        bot_config = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(bot_config)
-    else:
-        # Last resort: try regular import if package is available on sys.path
-        try:
-            from bot import config as bot_config
-        except Exception:
-            bot_config = None
-except Exception:
-    bot_config = None
-
-TELEGRAM_BOT_TOKEN = os.getenv("MARKET_TELEGRAM_TOKEN") or (getattr(bot_config, "TELEGRAM_TOKEN", None) if bot_config else None)
-TELEGRAM_CHAT_ID = os.getenv("MARKET_TELEGRAM_CHAT_ID") or (str(getattr(bot_config, "CHAT_ID", "")) if bot_config else None)
+# Telegram settings (optional). Read only from environment/.env.
+TELEGRAM_BOT_TOKEN = os.getenv("MARKET_TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("MARKET_TELEGRAM_CHAT_ID")
 WS_URL = "wss://wsprice.csgo.com/connection/websocket"
 REST_PRICES_URL = "https://market.csgo.com/api/v2/prices/USD.json"
 GET_WS_TOKEN_URL = "https://market.csgo.com/api/v2/get-ws-token"
@@ -94,6 +112,151 @@ state = {"ignored": [], "confirmed": []}
 
 # Last state save timestamp for debouncing
 _last_state_save_ts = 0
+# Rate-limit repetitive upstream error logs.
+_last_balance_error_log_ts = 0
+
+# Telemetry settings and in-memory counters.
+METRICS_WINDOW_SEC = int(os.getenv("METRICS_WINDOW_SEC", "300"))
+METRICS_REPORT_SEC = int(os.getenv("METRICS_REPORT_SEC", "300"))
+metrics_state = {
+    "mode_events": [(time.time(), "unknown")],
+    "counts": {
+        "signal_ws": [],
+        "signal_rest": [],
+        "skip_filtered_ws": [],
+        "skip_filtered_rest": [],
+        "skip_dedupe_ws": [],
+        "skip_dedupe_rest": [],
+    },
+    "attempt_delays": [],
+}
+
+
+def metrics_set_mode(mode: str):
+    """Record mode transitions: ws/fallback/unknown."""
+    try:
+        now = time.time()
+        events = metrics_state.setdefault("mode_events", [])
+        if events and events[-1][1] == mode:
+            return
+        events.append((now, mode))
+    except Exception:
+        pass
+
+
+def metrics_inc(counter: str):
+    """Increment timestamped counter for rolling-window reports."""
+    try:
+        metrics_state.setdefault("counts", {}).setdefault(counter, []).append(time.time())
+    except Exception:
+        pass
+
+
+def metrics_add_attempt_delay(delay_sec: float):
+    """Store signal->attempt delay samples in seconds."""
+    try:
+        if delay_sec is None:
+            return
+        metrics_state.setdefault("attempt_delays", []).append((time.time(), float(delay_sec)))
+    except Exception:
+        pass
+
+
+def metrics_prune(now_ts: float):
+    """Prune telemetry buffers to rolling window."""
+    try:
+        keep_from = now_ts - METRICS_WINDOW_SEC
+        for key, arr in metrics_state.setdefault("counts", {}).items():
+            metrics_state["counts"][key] = [t for t in arr if t >= keep_from]
+
+        delays = metrics_state.setdefault("attempt_delays", [])
+        metrics_state["attempt_delays"] = [(t, d) for (t, d) in delays if t >= keep_from]
+
+        events = metrics_state.setdefault("mode_events", [])
+        # Keep at most one event just before the window start to reconstruct durations.
+        if not events:
+            metrics_state["mode_events"] = [(now_ts, "unknown")]
+            return
+        idx = 0
+        for i, (ts, _m) in enumerate(events):
+            if ts <= keep_from:
+                idx = i
+            else:
+                break
+        metrics_state["mode_events"] = events[max(0, idx):]
+    except Exception:
+        pass
+
+
+def metrics_mode_durations(now_ts: float):
+    """Compute mode durations over rolling window."""
+    keep_from = now_ts - METRICS_WINDOW_SEC
+    events = metrics_state.get("mode_events", []) or [(keep_from, "unknown")]
+
+    # Determine starting mode at window boundary.
+    start_mode = "unknown"
+    for ts, mode in events:
+        if ts <= keep_from:
+            start_mode = mode
+        else:
+            break
+
+    durations = {"ws": 0.0, "fallback": 0.0, "unknown": 0.0}
+    prev_ts = keep_from
+    prev_mode = start_mode
+
+    for ts, mode in events:
+        if ts < keep_from:
+            continue
+        if ts > now_ts:
+            break
+        durations[prev_mode] = durations.get(prev_mode, 0.0) + max(0.0, ts - prev_ts)
+        prev_ts = ts
+        prev_mode = mode
+
+    durations[prev_mode] = durations.get(prev_mode, 0.0) + max(0.0, now_ts - prev_ts)
+    return durations
+
+
+async def metrics_reporter_loop():
+    """Emit periodic 5-minute reliability stats to logs."""
+    while True:
+        try:
+            await asyncio.sleep(max(10, METRICS_REPORT_SEC))
+            now_ts = time.time()
+            metrics_prune(now_ts)
+            durations = metrics_mode_durations(now_ts)
+            window = float(METRICS_WINDOW_SEC)
+
+            ws_pct = (durations.get("ws", 0.0) / window) * 100.0
+            fb_pct = (durations.get("fallback", 0.0) / window) * 100.0
+            unk_pct = (durations.get("unknown", 0.0) / window) * 100.0
+
+            counts = metrics_state.get("counts", {})
+            signals_ws = len(counts.get("signal_ws", []))
+            signals_rest = len(counts.get("signal_rest", []))
+            skip_filtered = len(counts.get("skip_filtered_ws", [])) + len(counts.get("skip_filtered_rest", []))
+            skip_dedupe = len(counts.get("skip_dedupe_ws", [])) + len(counts.get("skip_dedupe_rest", []))
+
+            delays = [d for (_t, d) in metrics_state.get("attempt_delays", [])]
+            avg_delay = (sum(delays) / len(delays)) if delays else 0.0
+
+            logger.info(
+                "Metrics(5m): mode_ws=%.1f%% mode_fallback=%.1f%% mode_unknown=%.1f%% "
+                "signals_ws=%d signals_rest=%d skipped_filtered=%d skipped_dedupe=%d avg_signal_to_attempt=%.3fs",
+                ws_pct,
+                fb_pct,
+                unk_pct,
+                signals_ws,
+                signals_rest,
+                skip_filtered,
+                skip_dedupe,
+                avg_delay,
+            )
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("metrics_reporter_loop failed")
 
 # In-memory pending custom threshold requests: chat_id -> hash_name
 awaiting_custom = {}
@@ -487,6 +650,24 @@ state.setdefault("thresholds", {})
 state.setdefault("global_threshold", THRESHOLD)
 state.setdefault("session_spent", 0.0)
 state.setdefault("spent", {})
+
+# Safe startup mode: clear per-item thresholds and force MANUAL mode unless disabled via env.
+startup_changed = False
+if RESET_THRESHOLDS_ON_START:
+    if state.get("thresholds"):
+        logger.info("RESET_THRESHOLDS_ON_START enabled: clearing saved per-item thresholds")
+    state["thresholds"] = {}
+    state["global_threshold"] = SAFE_START_THRESHOLD_UNITS
+    startup_changed = True
+
+if RESET_MODE_ON_START and state.get("mode") != "MANUAL":
+    logger.info("RESET_MODE_ON_START enabled: forcing MANUAL mode on startup")
+    state["mode"] = "MANUAL"
+    startup_changed = True
+
+if startup_changed:
+    save_state(force=True)
+
 # Normalize any existing threshold keys so lookups by normalized name work
 try:
     thr = state.get("thresholds", {}) or {}
@@ -512,6 +693,7 @@ async def get_ws_token(session):
     """Fetch WebSocket token using REST API."""
     try:
         async with session.get(GET_WS_TOKEN_URL, params={"key": API_KEY}) as response:
+            status = response.status
             text = await response.text()
     except asyncio.CancelledError:
         # Allow cancellation to propagate gracefully during shutdown
@@ -519,23 +701,28 @@ async def get_ws_token(session):
     except Exception:
         logger.exception("get_ws_token request failed")
         return None
-        # Log raw response for debugging
-        if DEBUG_MODE:
-            logger.debug(f"get-ws-token raw response: {text[:500]}")
 
-        try:
-            data = json.loads(text)
-        except Exception:
-            logger.error("get-ws-token returned non-JSON response")
-            return None
+    # Log response details for debugging transient token errors.
+    if DEBUG_MODE:
+        logger.debug(f"get-ws-token status={status}, body={text[:500]}")
 
-        # Check for token existence safely (API may return 'token' or 'ws_token')
-        token = data.get("ws_token") or data.get("token")
-        if data.get("success") and token:
-            return token
-        else:
-            logger.error(f"Failed to get WS token: {data}")
-            return None
+    if status != 200:
+        logger.error(f"get-ws-token returned HTTP {status}")
+        return None
+
+    try:
+        data = json.loads(text)
+    except Exception:
+        logger.error("get-ws-token returned non-JSON response")
+        return None
+
+    # API may return token under different keys.
+    token = data.get("ws_token") or data.get("token")
+    if token:
+        return token
+
+    logger.error(f"Failed to get WS token: {data}")
+    return None
 
 # Define a global aiohttp.ClientSession
 session = None
@@ -598,9 +785,12 @@ async def websocket_listener():
             if fallback_task and not fallback_task.done():
                 fallback_task.cancel()
 
-            # add optional headers (User-Agent/Origin) which can help with some CDNs/proxies
-            extra_headers = [("User-Agent", WS_USER_AGENT), ("Origin", WS_ORIGIN)]
-            async with websockets.connect(f"{WS_URL}?token={ws_token}", extra_headers=extra_headers, ping_interval=20, open_timeout=10) as websocket:
+            # Add optional headers (User-Agent/Origin). websockets>=15 uses additional_headers.
+            ws_headers = [("User-Agent", WS_USER_AGENT), ("Origin", WS_ORIGIN)]
+            connect_kwargs = {"ping_interval": 20, "open_timeout": 10}
+            ws_ctx = websockets.connect(f"{WS_URL}?token={ws_token}", additional_headers=ws_headers, **connect_kwargs)
+            async with ws_ctx as websocket:
+                metrics_set_mode("ws")
                 subscription_message = json.dumps({"type": "subscribe", "data": "public:items:730:usd"})
                 await websocket.send(subscription_message)
                 if DEBUG_MODE:
@@ -625,8 +815,19 @@ async def websocket_listener():
                         payload = raw_msg[1:]
                         try:
                             parsed = json.loads(payload)
-                            events = parsed[0] if isinstance(parsed, list) and parsed else parsed
-                            process_event(events)
+                            # SockJS "a[...]" can contain a batch of JSON strings/events.
+                            if isinstance(parsed, list):
+                                for event_entry in parsed:
+                                    event_obj = event_entry
+                                    if isinstance(event_entry, str):
+                                        try:
+                                            event_obj = json.loads(event_entry)
+                                        except Exception:
+                                            logger.debug(f"Failed to decode nested WS event: {event_entry[:200]}")
+                                            continue
+                                    process_event(event_obj)
+                            else:
+                                process_event(parsed)
                         except json.JSONDecodeError:
                             logger.error(f"Failed to decode JSON payload: {payload[:200]}")
                     elif raw_msg.startswith("o"):
@@ -639,8 +840,13 @@ async def websocket_listener():
 
         except Exception as e:
             logger.error(f"WebSocket error: {e}")
-            # jittered exponential backoff with cap
-            retry_delay = min(retry_delay * 2, 30)
+            # For token-fetch failures, retry faster to reduce blind time.
+            err_text = str(e).lower()
+            if "ws_token" in err_text:
+                retry_delay = min(max(retry_delay, 1) + 1, 6)
+            else:
+                # jittered exponential backoff with cap for transport/protocol errors
+                retry_delay = min(retry_delay * 2, 30)
             sleep_for = retry_delay + random.uniform(0, 1.5)
             logger.info(f"WS reconnect sleeping {sleep_for:.2f}s before retry")
             await asyncio.sleep(sleep_for)
@@ -654,6 +860,7 @@ async def fallback_polling():
     # Reuse global session to avoid creating/destroying client sessions frequently
     await init_session()
     global session
+    metrics_set_mode("fallback")
     while True:
         try:
             async with session.get(REST_PRICES_URL, params={"key": API_KEY}) as response:
@@ -708,7 +915,7 @@ def enqueue_pending_auto(name: str, price_units: int, threshold_units: int = Non
             existing = entry.get("threshold_units")
             if existing is None or threshold_units < existing:
                 entry["threshold_units"] = threshold_units
-        entry["offers"].append({"price_units": int(price_units), "raw": raw})
+        entry["offers"].append({"price_units": int(price_units), "raw": raw, "signal_ts": time.time()})
         # schedule debounced task once
         if not entry.get("task"):
             entry["task"] = asyncio.create_task(debounced_auto_buy(key))
@@ -735,6 +942,11 @@ async def debounced_auto_buy(key: str):
         cheapest = min(offers, key=lambda o: o.get("price_units", 10**12))
         price_units = int(cheapest.get("price_units"))
         logger.info(f"Debounced AUTO buy: attempting single purchase for '{name}' cheapest={price_units/1000.0:.3f} USD from {len(offers)} offers")
+        try:
+            earliest_signal_ts = min(float(o.get("signal_ts", start_time)) for o in offers)
+            metrics_add_attempt_delay(max(0.0, time.time() - earliest_signal_ts))
+        except Exception:
+            pass
 
         # final safety check: only proceed if still in AUTO mode
         if state.get("mode") != "AUTO":
@@ -912,17 +1124,20 @@ def process_event(event):
     """Process a WebSocket event."""
     try:
         if not isinstance(event, dict):
+            metrics_inc("skip_filtered_ws")
             return
 
         name = event.get("market_hash_name") or event.get("name") or ""
         raw_price = event.get("price") or event.get("value")
         if raw_price is None:
+            metrics_inc("skip_filtered_ws")
             return
 
         try:
             price_float = float(raw_price)
             price_units = int(price_float * 1000)
         except Exception:
+            metrics_inc("skip_filtered_ws")
             return
 
         # Use normalized name for recent prices and thresholds
@@ -947,6 +1162,10 @@ def process_event(event):
         floating_margin = float(state.get("floating_margin_pct", 0.10))
 
         cfg_threshold = state.get("thresholds", {}).get(norm)
+        if REQUIRE_EXPLICIT_THRESHOLD and cfg_threshold is None:
+            metrics_inc("skip_filtered_ws")
+            logger.debug(f"WS skip for '{name}': explicit per-item threshold required")
+            return
         try:
             if cfg_threshold is not None:
                 effective_threshold_units = int(cfg_threshold)
@@ -954,6 +1173,10 @@ def process_event(event):
                 effective_threshold_units = int(baseline * (1.0 - floating_margin))
         except Exception:
             effective_threshold_units = THRESHOLD
+
+        # Apply hard safety cap from environment so restart cannot expand buy limit unexpectedly.
+        if HARD_MAX_BUY_UNITS > 0:
+            effective_threshold_units = min(effective_threshold_units, HARD_MAX_BUY_UNITS)
         # persist recent prices periodically
         save_state()
 
@@ -961,6 +1184,7 @@ def process_event(event):
         # Log decision details for debugging
         logger.debug(f"WS check for '{name}': price_units={price_units}, effective_threshold_units={effective_threshold_units}, cfg_threshold={cfg_threshold}")
         if price_units > effective_threshold_units:
+            metrics_inc("skip_filtered_ws")
             logger.debug(f"Skipping WS item '{name}': price {price_units} > threshold {effective_threshold_units}")
             return
 
@@ -968,8 +1192,10 @@ def process_event(event):
         timestamp_bucket = int(time.time() // DEDUPE_BUCKET_SEC)
         alert_key = f"{name}|{price_units}|{timestamp_bucket}"
         if alert_key in state["processed_alerts"]:
+            metrics_inc("skip_dedupe_ws")
             return
         state["processed_alerts"][alert_key] = int(time.time())
+        metrics_inc("signal_ws")
         save_state()
 
         if state.get("mode") == "AUTO":
@@ -1714,18 +1940,44 @@ async def handle_balance_command(session, chat_id):
 # Функция для проверки баланса
 async def check_balance():
     """Check the current balance, fetching from the API if necessary."""
+    global _last_balance_error_log_ts
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://market.csgo.com/api/v2/get-money", params={"key": API_KEY}) as response:
-                data = await response.json()
-                if data.get("success"):
-                    # API returns money as USD float
-                    return float(data.get("money", 0))
-                else:
-                    logger.error(f"Failed to fetch balance: {data}")
-                    return 0
+        await init_session()
+        s = session
+        async with s.get("https://market.csgo.com/api/v2/get-money", params={"key": API_KEY}, timeout=12) as response:
+            status = response.status
+            text = await response.text()
+
+        if status != 200:
+            now = int(time.time())
+            if now - _last_balance_error_log_ts >= 30:
+                logger.warning(f"Balance endpoint HTTP {status}; body={text[:200]}")
+                _last_balance_error_log_ts = now
+            return 0
+
+        try:
+            data = json.loads(text)
+        except Exception:
+            now = int(time.time())
+            if now - _last_balance_error_log_ts >= 30:
+                logger.warning(f"Balance endpoint returned non-JSON body: {text[:200]}")
+                _last_balance_error_log_ts = now
+            return 0
+
+        if data.get("success"):
+            # API returns money as USD float
+            return float(data.get("money", 0))
+
+        now = int(time.time())
+        if now - _last_balance_error_log_ts >= 30:
+            logger.warning(f"Failed to fetch balance: {data}")
+            _last_balance_error_log_ts = now
+        return 0
     except Exception as e:
-        logger.exception(f"Error fetching balance: {e}")
+        now = int(time.time())
+        if now - _last_balance_error_log_ts >= 30:
+            logger.warning(f"Error fetching balance: {e}")
+            _last_balance_error_log_ts = now
         return 0
 
 # Функция для выполнения покупки с проверкой баланса
@@ -1832,21 +2084,26 @@ def process_item(item):
     try:
         name = item.get("market_hash_name") or item.get("name")
         if not name:
+            metrics_inc("skip_filtered_rest")
             return
 
         if TARGET_NAME_ID:
             if item.get("name_id") != TARGET_NAME_ID:
+                metrics_inc("skip_filtered_rest")
                 return
         else:
             if not any(t.lower() in name.lower() for t in TARGET_MARKET_HASHES):
+                metrics_inc("skip_filtered_rest")
                 return
 
         raw_price = item.get("price") or item.get("value")
         if raw_price is None:
+            metrics_inc("skip_filtered_rest")
             return
         try:
             price_float = float(raw_price)
         except Exception:
+            metrics_inc("skip_filtered_rest")
             return
 
         # Determine effective threshold per-item (units) using recent prices (floating)
@@ -1867,6 +2124,11 @@ def process_item(item):
             baseline = THRESHOLD
         floating_margin = float(state.get("floating_margin_pct", 0.10))
         cfg_threshold = state.get("thresholds", {}).get(norm)
+        if REQUIRE_EXPLICIT_THRESHOLD and cfg_threshold is None:
+            metrics_inc("skip_filtered_rest")
+            logger.debug(f"REST skip for '{name}': explicit per-item threshold required")
+            save_state()
+            return
         try:
             if cfg_threshold is not None:
                 effective_threshold_units = int(cfg_threshold)
@@ -1874,17 +2136,32 @@ def process_item(item):
                 effective_threshold_units = int(baseline * (1.0 - floating_margin))
         except Exception:
             effective_threshold_units = THRESHOLD
+
+        # Apply hard safety cap from environment so restart cannot expand buy limit unexpectedly.
+        if HARD_MAX_BUY_UNITS > 0:
+            effective_threshold_units = min(effective_threshold_units, HARD_MAX_BUY_UNITS)
         logger.debug(f"REST check for '{name}': price_units={price_units}, effective_threshold_units={effective_threshold_units}, cfg_threshold={cfg_threshold}, baseline={baseline}, floating_margin={floating_margin}, norm={norm}")
         if price_units > effective_threshold_units:
+            metrics_inc("skip_filtered_rest")
             logger.debug(f"Skipping REST item '{name}': price {price_units} > threshold {effective_threshold_units}")
             save_state()
             return
+
+        # Dedupe REST alerts in the same bucket to avoid repeated Telegram spam.
+        timestamp_bucket = int(time.time() // DEDUPE_BUCKET_SEC)
+        alert_key = f"{name}|{price_units}|{timestamp_bucket}"
+        if alert_key in state["processed_alerts"]:
+            metrics_inc("skip_dedupe_rest")
+            return
+        state["processed_alerts"][alert_key] = int(time.time())
+        metrics_inc("signal_rest")
+        save_state()
 
         # If AUTO mode is enabled, aggregate offers for debounced buy; otherwise notify
         if state.get("mode") == "AUTO":
             enqueue_pending_auto(name, price_units, threshold_units=effective_threshold_units, raw=item)
         else:
-            asyncio.create_task(notify_telegram({"source": "rest", "name": name, "price": price_float, "raw": item}))
+            asyncio.create_task(notify_telegram({"source": "rest", "name": name, "price": price_float, "lot_key": alert_key, "raw": item}))
     except Exception:
         logger.exception("Error processing REST item")
 
@@ -1899,14 +2176,18 @@ async def notify_telegram(data):
     # Generate alert_id
     alert_id = data.get("lot_key") or str(uuid.uuid4())
 
-    # Determine recommendation
+    # Determine recommendation without extra API calls to avoid noisy errors during upstream outages.
     try:
         price_units = int(float(price) * 1000)
-        balance = await check_balance()
-        if price_units <= THRESHOLD and balance >= price_units / 1000:
-            recommendation = "BUY"
+        norm = normalize_name(name)
+        cfg_threshold = state.get("thresholds", {}).get(norm)
+        if cfg_threshold is not None:
+            effective_threshold_units = int(cfg_threshold)
         else:
-            recommendation = "DO NOT BUY"
+            effective_threshold_units = THRESHOLD
+        if HARD_MAX_BUY_UNITS > 0:
+            effective_threshold_units = min(effective_threshold_units, HARD_MAX_BUY_UNITS)
+        recommendation = "BUY" if price_units <= effective_threshold_units else "DO NOT BUY"
     except Exception:
         price_units = None
         recommendation = "unknown"
@@ -1980,6 +2261,8 @@ if __name__ == "__main__":
     async def _on_startup(app):
         logger.info("Starting background websocket listener task")
         app['ws_task'] = asyncio.create_task(websocket_listener())
+        logger.info("Starting metrics reporter task")
+        app['metrics_task'] = asyncio.create_task(metrics_reporter_loop())
 
     async def _on_cleanup(app):
         # Cancel background task
@@ -1995,6 +2278,19 @@ if __name__ == "__main__":
                     logger.warning("ws_task did not exit within timeout during cleanup")
             except Exception:
                 logger.exception("Error cancelling ws_task during cleanup")
+
+        mt = app.get('metrics_task')
+        if mt:
+            try:
+                mt.cancel()
+                try:
+                    await asyncio.wait_for(mt, timeout=5)
+                except asyncio.CancelledError:
+                    pass
+                except asyncio.TimeoutError:
+                    logger.warning("metrics_task did not exit within timeout during cleanup")
+            except Exception:
+                logger.exception("Error cancelling metrics_task during cleanup")
         # Close global aiohttp session if any
         await close_session()
 

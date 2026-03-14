@@ -8,6 +8,33 @@ import os
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
 
+def load_dotenv_file(env_path):
+    """Load .env values without overriding real environment variables."""
+    try:
+        if not os.path.exists(env_path):
+            return
+        with open(env_path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if not key:
+                    continue
+                if len(value) >= 2 and ((value[0] == '"' and value[-1] == '"') or (value[0] == "'" and value[-1] == "'")):
+                    value = value[1:-1]
+                os.environ.setdefault(key, value)
+    except Exception:
+        logging.exception("Failed to load .env file")
+
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv_file(os.path.join(PROJECT_ROOT, ".env"))
+PRICE_THRESHOLD = float(os.getenv("PRICE_THRESHOLD", "10000"))
+
+
 async def get_ws_token(api_key):
     logging.info("Fetching WebSocket token...")
     async with aiohttp.ClientSession() as session:
@@ -89,7 +116,6 @@ async def process_item(item):
     except Exception:
         logging.exception("Price is not a number; skipping")
         return
-    from bot.config import PRICE_THRESHOLD
     if price_num < PRICE_THRESHOLD:  # Пример пороговой цены
         logging.info(f"Item matches criteria: {name_id}, {price}")
         # Попытка отправить уведомление через существующий модуль
@@ -226,19 +252,9 @@ async def polling_loop(api_key, interval=10):
 
 
 if __name__ == '__main__':
-    # Попробовать взять ключ из переменных окружения или из config
-    try:
-        from bot.config import MARKET_API_KEY as _cfg_key
-    except Exception:
-        logging.exception("Failed importing bot.config; trying local import")
-        try:
-            from bot.config import MARKET_API_KEY as _cfg_key
-        except Exception:
-            logging.exception("Failed importing config from local module")
-            _cfg_key = None
-    api_key = os.getenv('MARKET_API_KEY') or _cfg_key
+    api_key = os.getenv('MARKET_API_KEY')
     if not api_key:
-        logging.error('No MARKET_API_KEY provided. Set env or bot.config.MARKET_API_KEY')
+        logging.error('No MARKET_API_KEY provided. Set environment variable MARKET_API_KEY')
     else:
         try:
             asyncio.run(websocket_listener(api_key))
