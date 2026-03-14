@@ -11,6 +11,7 @@ import csv
 import logging
 import os
 import uuid
+import inspect
 
 
 def load_dotenv_file(env_path: str = ".env"):
@@ -114,6 +115,23 @@ state = {"ignored": [], "confirmed": []}
 _last_state_save_ts = 0
 # Rate-limit repetitive upstream error logs.
 _last_balance_error_log_ts = 0
+
+
+def detect_ws_headers_kwarg() -> str:
+    """Detect correct websockets.connect header kwarg across library versions."""
+    try:
+        params = inspect.signature(websockets.connect).parameters
+        if "additional_headers" in params:
+            return "additional_headers"
+        if "extra_headers" in params:
+            return "extra_headers"
+    except Exception:
+        pass
+    # Default to newer name; fallback logic in caller still handles failures.
+    return "additional_headers"
+
+
+WS_HEADERS_KWARG = detect_ws_headers_kwarg()
 
 # Telemetry settings and in-memory counters.
 METRICS_WINDOW_SEC = int(os.getenv("METRICS_WINDOW_SEC", "300"))
@@ -832,8 +850,8 @@ async def websocket_listener():
 
             # Add optional headers (User-Agent/Origin). websockets>=15 uses additional_headers.
             ws_headers = [("User-Agent", WS_USER_AGENT), ("Origin", WS_ORIGIN)]
-            connect_kwargs = {"ping_interval": 20, "open_timeout": 10}
-            ws_ctx = websockets.connect(f"{WS_URL}?token={ws_token}", additional_headers=ws_headers, **connect_kwargs)
+            connect_kwargs = {"ping_interval": 20, "open_timeout": 10, WS_HEADERS_KWARG: ws_headers}
+            ws_ctx = websockets.connect(f"{WS_URL}?token={ws_token}", **connect_kwargs)
             async with ws_ctx as websocket:
                 metrics_set_mode("ws")
                 subscription_message = json.dumps({"type": "subscribe", "data": "public:items:730:usd"})
