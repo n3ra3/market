@@ -258,6 +258,51 @@ async def metrics_reporter_loop():
         except Exception:
             logger.exception("metrics_reporter_loop failed")
 
+
+def build_stats_text() -> str:
+    """Build human-readable telemetry snapshot for Telegram /stats command."""
+    now_ts = time.time()
+    metrics_prune(now_ts)
+    durations = metrics_mode_durations(now_ts)
+    window = float(METRICS_WINDOW_SEC)
+
+    ws_pct = (durations.get("ws", 0.0) / window) * 100.0
+    fb_pct = (durations.get("fallback", 0.0) / window) * 100.0
+    unk_pct = (durations.get("unknown", 0.0) / window) * 100.0
+
+    counts = metrics_state.get("counts", {})
+    signals_ws = len(counts.get("signal_ws", []))
+    signals_rest = len(counts.get("signal_rest", []))
+    skip_filtered_ws = len(counts.get("skip_filtered_ws", []))
+    skip_filtered_rest = len(counts.get("skip_filtered_rest", []))
+    skip_dedupe_ws = len(counts.get("skip_dedupe_ws", []))
+    skip_dedupe_rest = len(counts.get("skip_dedupe_rest", []))
+
+    delays = [d for (_t, d) in metrics_state.get("attempt_delays", [])]
+    avg_delay = (sum(delays) / len(delays)) if delays else 0.0
+
+    mode_now = state.get("mode", "MANUAL")
+    target_thr = []
+    for t in TARGET_MARKET_HASHES:
+        nk = normalize_name(t)
+        tv = state.get("thresholds", {}).get(nk)
+        if tv is None:
+            target_thr.append(f"{t}: not set")
+        else:
+            target_thr.append(f"{t}: {int(tv)} units (${int(tv)/1000:.3f})")
+
+    lines = [
+        f"Stats window: {METRICS_WINDOW_SEC}s",
+        f"Mode now: {mode_now}",
+        f"Source share: WS {ws_pct:.1f}%, fallback {fb_pct:.1f}%, unknown {unk_pct:.1f}%",
+        f"Signals: ws={signals_ws}, rest={signals_rest}",
+        f"Skipped filtered: ws={skip_filtered_ws}, rest={skip_filtered_rest}",
+        f"Skipped dedupe: ws={skip_dedupe_ws}, rest={skip_dedupe_rest}",
+        f"Avg signal->attempt delay (AUTO): {avg_delay:.3f}s",
+        f"Thresholds: {'; '.join(target_thr) if target_thr else '(no targets)'}",
+    ]
+    return "\n".join(lines)
+
 # In-memory pending custom threshold requests: chat_id -> hash_name
 awaiting_custom = {}
 # Recent observed prices per item for floating threshold calculations
@@ -1633,6 +1678,12 @@ async def poll_telegram_updates():
                                 await send_simple_message(tg_session, chat_id_msg, header + body)
                             except Exception:
                                 await send_simple_message(tg_session, chat_id_msg, "Failed to read thresholds")
+                        elif text_msg.startswith("/stats"):
+                            try:
+                                await send_simple_message(tg_session, chat_id_msg, build_stats_text())
+                            except Exception:
+                                logger.exception("Failed to handle /stats")
+                                await send_simple_message(tg_session, chat_id_msg, "Failed to build stats report")
                         elif text_msg.startswith("/history"):
                             # Получение истории покупок через API и отправка текстового отчета (CSV)
                             try:
