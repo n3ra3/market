@@ -83,6 +83,9 @@ DEDUPE_BUCKET_SEC = int(os.getenv("DEDUPE_BUCKET_SEC", "60"))
 # Debounce window (seconds) to aggregate multiple near-simultaneous offers for same item.
 # Lower -> attempt buys faster for single events. Default reduced to 1.
 DEBOUNCE_SEC = float(os.getenv("DEBOUNCE_SEC", "0.3"))  # Updated to 0.3 seconds for safe API usage
+# Minimum interval between AUTO triggers for the same normalized item name.
+# Keeps AUTO responsive (seconds) without minute-level throttling.
+AUTO_RECHECK_INTERVAL_SEC = float(os.getenv("AUTO_RECHECK_INTERVAL_SEC", "2"))
 # Maximum number of lots to buy in one aggregated AUTO window (0 = disabled).
 # Set >0 to allow small batch purchases when many offers appear simultaneously.
 MAX_BATCH_BUY = int(os.getenv("MAX_BATCH_BUY", "0"))
@@ -90,6 +93,9 @@ MAX_BATCH_BUY = int(os.getenv("MAX_BATCH_BUY", "0"))
 PURCHASE_LOG = os.path.join(os.getcwd(), "purchase_history.csv")
 DAILY_SPEND_LIMIT_USD = float(os.getenv("DAILY_SPEND_LIMIT_USD", "0"))  # 0 = disabled
 SESSION_SPEND_LIMIT_USD = float(os.getenv("SESSION_SPEND_LIMIT_USD", "0"))  # 0 = disabled
+# Market API hard safety limit (<5 req/s per provider rules)
+MARKET_MAX_RPS = float(os.getenv("MARKET_MAX_RPS", "4.5"))
+MARKET_MIN_INTERVAL_SEC = 1.0 / MARKET_MAX_RPS if MARKET_MAX_RPS > 0 else 0.0
 
 # Logging setup
 logging.basicConfig(level=logging.DEBUG if DEBUG_MODE else logging.INFO)
@@ -115,6 +121,8 @@ state = {"ignored": [], "confirmed": []}
 _last_state_save_ts = 0
 # Rate-limit repetitive upstream error logs.
 _last_balance_error_log_ts = 0
+_market_last_request_ts = 0.0
+_market_rate_lock = asyncio.Lock()
 
 
 def detect_ws_headers_kwarg() -> str:
@@ -132,6 +140,29 @@ def detect_ws_headers_kwarg() -> str:
 
 
 WS_HEADERS_KWARG = detect_ws_headers_kwarg()
+
+
+async def market_rate_limit_wait():
+    """Global rate limiter for market.csgo.com requests."""
+    global _market_last_request_ts
+    if MARKET_MIN_INTERVAL_SEC <= 0:
+        return
+    async with _market_rate_lock:
+        now = time.monotonic()
+        wait_for = MARKET_MIN_INTERVAL_SEC - (now - _market_last_request_ts)
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
+        _market_last_request_ts = time.monotonic()
+
+
+async def market_get_text(session_obj, url: str, *, params=None, headers=None, timeout=20):
+    """Rate-limited GET to market API. Returns (status, text, content_type)."""
+    await market_rate_limit_wait()
+    async with session_obj.get(url, params=params, headers=headers, timeout=timeout) as response:
+        status = response.status
+        text = await response.text()
+        content_type = response.headers.get("Content-Type", "")
+        return status, text, content_type
 
 # Telemetry settings and in-memory counters.
 METRICS_WINDOW_SEC = int(os.getenv("METRICS_WINDOW_SEC", "300"))
@@ -755,9 +786,7 @@ except Exception:
 async def get_ws_token(session):
     """Fetch WebSocket token using REST API."""
     try:
-        async with session.get(GET_WS_TOKEN_URL, params={"key": API_KEY}) as response:
-            status = response.status
-            text = await response.text()
+        status, text, _ct = await market_get_text(session, GET_WS_TOKEN_URL, params={"key": API_KEY}, timeout=15)
     except asyncio.CancelledError:
         # Allow cancellation to propagate gracefully during shutdown
         return None
@@ -926,8 +955,17 @@ async def fallback_polling():
     metrics_set_mode("fallback")
     while True:
         try:
-            async with session.get(REST_PRICES_URL, params={"key": API_KEY}) as response:
-                data = await response.json()
+            status, text, _ct = await market_get_text(session, REST_PRICES_URL, params={"key": API_KEY}, timeout=20)
+            if status != 200:
+                logger.error(f"Fallback prices endpoint HTTP {status}")
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+            try:
+                data = json.loads(text)
+            except Exception:
+                logger.error(f"Fallback prices endpoint returned non-JSON body: {text[:200]}")
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
 
             if data.get("success"):
                 items = data.get("items", [])
@@ -965,6 +1003,8 @@ async def fallback_polling():
 
 # Temporary storage for pending offers
 pending_offers = {}
+# Last AUTO trigger timestamps by normalized item name
+last_auto_trigger_ts = {}
 
 # Helper: enqueue offers for debounced AUTO buying
 def enqueue_pending_auto(name: str, price_units: int, threshold_units: int = None, raw: dict | None = None):
@@ -1148,8 +1188,13 @@ async def fetch_available_offers(name: str, max_price_units: int):
     try:
         await init_session()
         s = session
-        async with s.get(REST_PRICES_URL, params={"key": API_KEY}, timeout=20) as resp:
-            data = await resp.json()
+        status, text, _ct = await market_get_text(s, REST_PRICES_URL, params={"key": API_KEY}, timeout=20)
+        if status != 200:
+            return []
+        try:
+            data = json.loads(text)
+        except Exception:
+            return []
 
         if not data.get("success"):
             return []
@@ -1254,17 +1299,24 @@ def process_event(event):
         # Защита от спама
         timestamp_bucket = int(time.time() // DEDUPE_BUCKET_SEC)
         alert_key = f"{name}|{price_units}|{timestamp_bucket}"
-        if alert_key in state["processed_alerts"]:
-            metrics_inc("skip_dedupe_ws")
-            return
-        state["processed_alerts"][alert_key] = int(time.time())
-        metrics_inc("signal_ws")
-        save_state()
 
         if state.get("mode") == "AUTO":
+            now_ts = time.time()
+            prev_ts = float(last_auto_trigger_ts.get(norm, 0.0) or 0.0)
+            if AUTO_RECHECK_INTERVAL_SEC > 0 and (now_ts - prev_ts) < AUTO_RECHECK_INTERVAL_SEC:
+                metrics_inc("skip_dedupe_ws")
+                return
+            last_auto_trigger_ts[norm] = now_ts
+            metrics_inc("signal_ws")
             # Aggregate near-simultaneous offers and debounce actual buy
             enqueue_pending_auto(name, price_units, threshold_units=effective_threshold_units, raw=event)
         else:
+            if alert_key in state["processed_alerts"]:
+                metrics_inc("skip_dedupe_ws")
+                return
+            state["processed_alerts"][alert_key] = int(time.time())
+            metrics_inc("signal_ws")
+            save_state()
             # Notify asynchronously
             asyncio.create_task(notify_telegram({
                 "source": "ws",
@@ -2013,9 +2065,12 @@ async def check_balance():
     try:
         await init_session()
         s = session
-        async with s.get("https://market.csgo.com/api/v2/get-money", params={"key": API_KEY}, timeout=12) as response:
-            status = response.status
-            text = await response.text()
+        status, text, _ct = await market_get_text(
+            s,
+            "https://market.csgo.com/api/v2/get-money",
+            params={"key": API_KEY},
+            timeout=12,
+        )
 
         if status != 200:
             now = int(time.time())
@@ -2101,47 +2156,49 @@ async def buy_item(hash_name: str, price: int, source: str = "manual", raw=None)
         await init_session()
         s = session
         headers = {"User-Agent": WS_USER_AGENT, "Origin": WS_ORIGIN}
-        async with s.get(url, params=params, headers=headers, timeout=15) as response:
-            content_type = response.headers.get("Content-Type", "")
-            text = await response.text()
-            # If server returned HTML (e.g., rate-limit page or captcha), log full text for debugging
-            if "application/json" not in content_type:
-                logger.error(f"Buy endpoint returned non-JSON content-type: {content_type}; body={text[:1000]}")
-                # Try to surface useful message
-                return False, f"unexpected content-type {content_type}: {text[:200]}"
+        status, text, content_type = await market_get_text(s, url, params=params, headers=headers, timeout=15)
+        if status != 200:
+            logger.error(f"Buy endpoint HTTP {status}; body={text[:300]}")
+            return False, f"http-{status}"
 
+        # If server returned HTML (e.g., rate-limit page or captcha), log full text for debugging
+        if "application/json" not in content_type:
+            logger.error(f"Buy endpoint returned non-JSON content-type: {content_type}; body={text[:1000]}")
+            # Try to surface useful message
+            return False, f"unexpected content-type {content_type}: {text[:200]}"
+
+        try:
+            data = json.loads(text)
+        except Exception:
+            logger.error(f"Failed to parse JSON from buy response: {text[:1000]}")
+            return False, "invalid-json-response"
+
+        if data.get("success"):
+            logger.info(f"Successfully bought {hash_name} for {price / 1000:.2f} USD")
             try:
-                data = json.loads(text)
+                record_purchase(hash_name, price, offer_id=data.get("id"), raw=raw, source=source)
+                try:
+                    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                        await send_simple_message(s, TELEGRAM_CHAT_ID, f"Purchase recorded: {hash_name} for ${price/1000:.3f} (id: {data.get('id')})")
+                except Exception:
+                    logger.exception("Failed to send purchase summary message")
             except Exception:
-                logger.error(f"Failed to parse JSON from buy response: {text[:1000]}")
-                return False, "invalid-json-response"
+                logger.exception("Failed recording purchase after buy")
+            return True, data.get("id")
 
-            if data.get("success"):
-                logger.info(f"Successfully bought {hash_name} for {price / 1000:.2f} USD")
-                try:
-                    record_purchase(hash_name, price, offer_id=data.get("id"), raw=raw, source=source)
-                    try:
-                        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                            await send_simple_message(s, TELEGRAM_CHAT_ID, f"Purchase recorded: {hash_name} for ${price/1000:.3f} (id: {data.get('id')})")
-                    except Exception:
-                        logger.exception("Failed to send purchase summary message")
-                except Exception:
-                    logger.exception("Failed recording purchase after buy")
-                return True, data.get("id")
+        # Not success
+        err = data.get("error") or data
+        logger.error(f"Failed to buy {hash_name}: {err}")
+        # If provider says Not money, re-check balance to log real balance and avoid blind retries
+        if isinstance(err, str) and "Not money" in err:
+            try:
+                bal = await check_balance()
+                logger.warning(f"Buy failed due to Not money; balance reported: {bal}")
+                return False, f"Not money; balance={bal}"
+            except Exception:
+                return False, "Not money"
 
-            # Not success
-            err = data.get("error") or data
-            logger.error(f"Failed to buy {hash_name}: {err}")
-            # If provider says Not money, re-check balance to log real balance and avoid blind retries
-            if isinstance(err, str) and "Not money" in err:
-                try:
-                    bal = await check_balance()
-                    logger.warning(f"Buy failed due to Not money; balance reported: {bal}")
-                    return False, f"Not money; balance={bal}"
-                except Exception:
-                    return False, "Not money"
-
-            return False, err
+        return False, err
     except Exception as e:
         logger.exception("Error during purchase")
         return False, str(e)
@@ -2216,20 +2273,27 @@ def process_item(item):
             save_state()
             return
 
-        # Dedupe REST alerts in the same bucket to avoid repeated Telegram spam.
+        # Dedupe key used for MANUAL notifications.
         timestamp_bucket = int(time.time() // DEDUPE_BUCKET_SEC)
         alert_key = f"{name}|{price_units}|{timestamp_bucket}"
-        if alert_key in state["processed_alerts"]:
-            metrics_inc("skip_dedupe_rest")
-            return
-        state["processed_alerts"][alert_key] = int(time.time())
-        metrics_inc("signal_rest")
-        save_state()
 
         # If AUTO mode is enabled, aggregate offers for debounced buy; otherwise notify
         if state.get("mode") == "AUTO":
+            now_ts = time.time()
+            prev_ts = float(last_auto_trigger_ts.get(norm, 0.0) or 0.0)
+            if AUTO_RECHECK_INTERVAL_SEC > 0 and (now_ts - prev_ts) < AUTO_RECHECK_INTERVAL_SEC:
+                metrics_inc("skip_dedupe_rest")
+                return
+            last_auto_trigger_ts[norm] = now_ts
+            metrics_inc("signal_rest")
             enqueue_pending_auto(name, price_units, threshold_units=effective_threshold_units, raw=item)
         else:
+            if alert_key in state["processed_alerts"]:
+                metrics_inc("skip_dedupe_rest")
+                return
+            state["processed_alerts"][alert_key] = int(time.time())
+            metrics_inc("signal_rest")
+            save_state()
             asyncio.create_task(notify_telegram({"source": "rest", "name": name, "price": price_float, "lot_key": alert_key, "raw": item}))
     except Exception:
         logger.exception("Error processing REST item")
