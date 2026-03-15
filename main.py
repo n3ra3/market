@@ -873,15 +873,15 @@ async def websocket_listener():
             if not ws_token:
                 raise Exception("No ws_token received")
 
-            # If fallback was running, cancel it (we have WS now)
-            if fallback_task and not fallback_task.done():
-                fallback_task.cancel()
-
             # Add optional headers (User-Agent/Origin). websockets>=15 uses additional_headers.
             ws_headers = [("User-Agent", WS_USER_AGENT), ("Origin", WS_ORIGIN)]
             connect_kwargs = {"ping_interval": 20, "open_timeout": 10, WS_HEADERS_KWARG: ws_headers}
             ws_ctx = websockets.connect(f"{WS_URL}?token={ws_token}", **connect_kwargs)
             async with ws_ctx as websocket:
+                # Stop fallback only after WS handshake succeeds.
+                # This avoids blind gaps during token/handshake failures and backoff sleeps.
+                if fallback_task and not fallback_task.done():
+                    fallback_task.cancel()
                 metrics_set_mode("ws")
                 subscription_message = json.dumps({"type": "subscribe", "data": "public:items:730:usd"})
                 await websocket.send(subscription_message)
