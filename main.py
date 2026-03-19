@@ -121,8 +121,18 @@ state = {"ignored": [], "confirmed": []}
 _last_state_save_ts = 0
 # Rate-limit repetitive upstream error logs.
 _last_balance_error_log_ts = 0
+_last_known_balance_usd = None
+_last_known_balance_ts = 0
 _market_last_request_ts = 0.0
 _market_rate_lock = asyncio.Lock()
+
+# Telegram anti-flood controls.
+TELEGRAM_MIN_SEND_INTERVAL_SEC = float(os.getenv("TELEGRAM_MIN_SEND_INTERVAL_SEC", "1.2"))
+TELEGRAM_AUTO_DUPLICATE_WINDOW_SEC = int(os.getenv("TELEGRAM_AUTO_DUPLICATE_WINDOW_SEC", "45"))
+_tg_send_lock = asyncio.Lock()
+_tg_last_send_ts = 0.0
+_tg_block_until_ts = 0.0
+_tg_auto_recent_msgs = {}
 
 
 def detect_ws_headers_kwarg() -> str:
@@ -1095,11 +1105,13 @@ async def debounced_auto_buy(key: str):
             try:
                 current_balance = await check_balance()
             except Exception:
-                current_balance = 0
-            if current_balance < (tgt_price / 1000.0):
+                current_balance = None
+            if current_balance is not None and current_balance < (tgt_price / 1000.0):
                 logger.warning(f"Batch buy stopped: insufficient balance for next lot. needed={tgt_price/1000.0:.3f}, balance={current_balance:.3f}")
                 last_err = f"insufficient_balance:{current_balance}"
                 break
+            if current_balance is None:
+                logger.warning("Balance check unavailable before buy; proceeding to buy endpoint")
 
             # Check spend limits stored in state
             allowed, reason = can_spend(tgt_price / 1000.0)
@@ -1936,25 +1948,72 @@ async def periodic_processed_cleanup():
 async def send_simple_message(session, chat_id, text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
+        global _tg_last_send_ts, _tg_block_until_ts
         try:
             sess_id = id(session)
             sess_closed = getattr(session, 'closed', None)
         except Exception:
             sess_id = None
             sess_closed = None
+
+        now = time.time()
+        # Drop repeated AUTO status messages in a short window.
+        # This prevents floods when market repeatedly returns the same failure.
+        if isinstance(text, str) and text.startswith("AUTO:"):
+            key = f"{chat_id}|{text}"
+            last_ts = float(_tg_auto_recent_msgs.get(key, 0.0) or 0.0)
+            if TELEGRAM_AUTO_DUPLICATE_WINDOW_SEC > 0 and (now - last_ts) < TELEGRAM_AUTO_DUPLICATE_WINDOW_SEC:
+                logger.debug(
+                    "send_simple_message skipped duplicate AUTO message (%.1fs window): %s",
+                    float(TELEGRAM_AUTO_DUPLICATE_WINDOW_SEC),
+                    text[:200],
+                )
+                return {"ok": True, "skipped": "duplicate-auto-message"}
+            _tg_auto_recent_msgs[key] = now
+            # Keep memory bounded.
+            if len(_tg_auto_recent_msgs) > 500:
+                cutoff = now - max(float(TELEGRAM_AUTO_DUPLICATE_WINDOW_SEC), 60.0)
+                _tg_auto_recent_msgs_keys = list(_tg_auto_recent_msgs.keys())
+                for k in _tg_auto_recent_msgs_keys:
+                    if float(_tg_auto_recent_msgs.get(k, 0.0) or 0.0) < cutoff:
+                        _tg_auto_recent_msgs.pop(k, None)
+
         payload = {"chat_id": chat_id, "text": text}
         masked = (TELEGRAM_BOT_TOKEN[:6] + "..." + TELEGRAM_BOT_TOKEN[-6:]) if TELEGRAM_BOT_TOKEN else "<no-token>"
         logger.debug(f"send_simple_message -> URL={url} token={masked} payload_keys={list(payload.keys())} session_id={sess_id} session_closed={sess_closed}")
-        async with session.post(url, json=payload) as r:
-            body = await r.text()
-            if r.status != 200:
-                logger.error(f"send_simple_message failed: {r.status} {body}")
-            else:
-                logger.debug(f"send_simple_message ok: {body[:200]}")
-            try:
-                return json.loads(body)
-            except Exception:
-                return {"ok": False, "raw": body}
+        async with _tg_send_lock:
+            now = time.time()
+            if _tg_block_until_ts > now:
+                remain = _tg_block_until_ts - now
+                logger.warning("Telegram send is temporarily blocked by previous 429; skipping message for %.1fs", remain)
+                return {"ok": False, "error": "telegram-429-cooldown", "retry_after": remain}
+
+            if TELEGRAM_MIN_SEND_INTERVAL_SEC > 0:
+                wait_for = TELEGRAM_MIN_SEND_INTERVAL_SEC - (now - _tg_last_send_ts)
+                if wait_for > 0:
+                    await asyncio.sleep(wait_for)
+
+            async with session.post(url, json=payload) as r:
+                body = await r.text()
+                _tg_last_send_ts = time.time()
+                if r.status != 200:
+                    logger.error(f"send_simple_message failed: {r.status} {body}")
+                    if r.status == 429:
+                        retry_after = None
+                        try:
+                            parsed = json.loads(body)
+                            retry_after = float(parsed.get("parameters", {}).get("retry_after", 0) or 0)
+                        except Exception:
+                            retry_after = 0
+                        if retry_after and retry_after > 0:
+                            _tg_block_until_ts = max(_tg_block_until_ts, time.time() + retry_after)
+                            logger.warning("Telegram 429 received; pausing sends for %.1fs", retry_after)
+                else:
+                    logger.debug(f"send_simple_message ok: {body[:200]}")
+                try:
+                    return json.loads(body)
+                except Exception:
+                    return {"ok": False, "raw": body}
     except Exception as e:
         logger.error(f"Failed to send simple message: {e}")
         return {"ok": False, "error": str(e)}
@@ -2061,7 +2120,7 @@ async def handle_balance_command(session, chat_id):
 # Функция для проверки баланса
 async def check_balance():
     """Check the current balance, fetching from the API if necessary."""
-    global _last_balance_error_log_ts
+    global _last_balance_error_log_ts, _last_known_balance_usd, _last_known_balance_ts
     try:
         await init_session()
         s = session
@@ -2077,7 +2136,7 @@ async def check_balance():
             if now - _last_balance_error_log_ts >= 30:
                 logger.warning(f"Balance endpoint HTTP {status}; body={text[:200]}")
                 _last_balance_error_log_ts = now
-            return 0
+            return None
 
         try:
             data = json.loads(text)
@@ -2086,29 +2145,35 @@ async def check_balance():
             if now - _last_balance_error_log_ts >= 30:
                 logger.warning(f"Balance endpoint returned non-JSON body: {text[:200]}")
                 _last_balance_error_log_ts = now
-            return 0
+            return None
 
         if data.get("success"):
             # API returns money as USD float
-            return float(data.get("money", 0))
+            bal = float(data.get("money", 0))
+            _last_known_balance_usd = bal
+            _last_known_balance_ts = int(time.time())
+            return bal
 
         now = int(time.time())
         if now - _last_balance_error_log_ts >= 30:
             logger.warning(f"Failed to fetch balance: {data}")
             _last_balance_error_log_ts = now
-        return 0
+        return None
     except Exception as e:
         now = int(time.time())
         if now - _last_balance_error_log_ts >= 30:
             logger.warning(f"Error fetching balance: {e}")
             _last_balance_error_log_ts = now
-        return 0
+        return None
 
 # Функция для выполнения покупки с проверкой баланса
 async def buy_item_with_balance_check(hash_name: str, price: int):
     """Check balance before attempting to buy an item."""
     try:
         balance = await check_balance()
+        if balance is None:
+            logger.warning("Balance check unavailable; continuing with buy attempt")
+            balance = float("inf")
         if balance >= price / 1000:
             # Check spend limits
             allowed, reason = can_spend(price / 1000.0)
@@ -2193,6 +2258,9 @@ async def buy_item(hash_name: str, price: int, source: str = "manual", raw=None)
         if isinstance(err, str) and "Not money" in err:
             try:
                 bal = await check_balance()
+                if bal is None:
+                    logger.warning("Buy failed due to Not money; balance check unavailable")
+                    return False, "Not money; balance=unknown"
                 logger.warning(f"Buy failed due to Not money; balance reported: {bal}")
                 return False, f"Not money; balance={bal}"
             except Exception:
