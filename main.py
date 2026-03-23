@@ -1101,12 +1101,15 @@ async def debounced_auto_buy(key: str):
         bought_count = 0
         last_err = None
         purchases_made = []
+        tried_count = 0
+        failed_count = 0
         for i in range(to_buy):
             if state.get("mode") != "AUTO":
                 logger.warning("Aborting batch buy: mode switched from AUTO")
                 break
             target_offer = offers_now[i] if i < len(offers_now) else cheapest
             tgt_price = int(target_offer.get("price_units", price_units))
+            tried_count += 1
 
             # Re-check real balance before attempting each purchase to avoid "Not money" races
             try:
@@ -1142,20 +1145,19 @@ async def debounced_auto_buy(key: str):
                     pass
             else:
                 last_err = res
+                failed_count += 1
                 logger.warning(f"Batch buy attempt failed for {name} at {tgt_price/1000.0:.3f}: {res}")
-                err_text = str(res).lower()
-                is_server_7 = (
-                    err_text.strip() == "7"
-                    or "server 7" in err_text
-                    or "error 7" in err_text
-                    or "ошибка сервера 7" in err_text
-                )
-                if is_server_7:
-                    logger.info(
-                        "Skipping invalid cheapest lot due to server error 7; trying next offer in batch"
-                    )
-                    continue
-                break
+                # Keep scanning all available offers below threshold in this batch.
+                continue
+
+        logger.info(
+            "Batch scan summary for %s: tried=%s bought=%s failed=%s available=%s",
+            name,
+            tried_count,
+            bought_count,
+            failed_count,
+            available,
+        )
 
         if bought_count:
             logger.info(f"Debounced AUTO buys completed for {name}: bought {bought_count}/{to_buy} lots")
@@ -1197,11 +1199,17 @@ async def debounced_auto_buy(key: str):
             except Exception:
                 logger.exception("Failed to send detailed AUTO batch report")
         else:
-            logger.warning(f"Debounced AUTO buy failed for {name}: {last_err}")
+            logger.warning(
+                f"Debounced AUTO buy failed for {name}: {last_err} (tried={tried_count}, failed={failed_count}, available={available})"
+            )
             try:
                 async with aiohttp.ClientSession() as s:
                     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                        await send_simple_message(s, TELEGRAM_CHAT_ID, f"AUTO: failed to buy {name}: {last_err}")
+                        await send_simple_message(
+                            s,
+                            TELEGRAM_CHAT_ID,
+                            f"AUTO: failed to buy {name}: {last_err} (tried={tried_count}, failed={failed_count}, available={available})",
+                        )
             except Exception:
                 logger.exception("Failed to send debounced AUTO failure message")
     except Exception:
