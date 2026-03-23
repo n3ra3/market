@@ -96,6 +96,13 @@ SESSION_SPEND_LIMIT_USD = float(os.getenv("SESSION_SPEND_LIMIT_USD", "0"))  # 0 
 # Market API hard safety limit (<5 req/s per provider rules)
 MARKET_MAX_RPS = float(os.getenv("MARKET_MAX_RPS", "4.5"))
 MARKET_MIN_INTERVAL_SEC = 1.0 / MARKET_MAX_RPS if MARKET_MAX_RPS > 0 else 0.0
+HISTORY_ALL_LOOKBACK_DAYS = int(os.getenv("HISTORY_ALL_LOOKBACK_DAYS", "3650"))
+HISTORY_SPLIT_THRESHOLD = int(os.getenv("HISTORY_SPLIT_THRESHOLD", "190"))
+HISTORY_MIN_SPLIT_SEC = int(os.getenv("HISTORY_MIN_SPLIT_SEC", "21600"))
+HISTORY_MAX_SPLIT_DEPTH = int(os.getenv("HISTORY_MAX_SPLIT_DEPTH", "16"))
+HISTORY_MAX_RANGE_SEC = int(os.getenv("HISTORY_MAX_RANGE_SEC", "2592000"))
+HISTORY_FETCH_RETRIES = int(os.getenv("HISTORY_FETCH_RETRIES", "3"))
+HISTORY_RETRY_BASE_SEC = float(os.getenv("HISTORY_RETRY_BASE_SEC", "1.0"))
 
 # Logging setup
 logging.basicConfig(level=logging.DEBUG if DEBUG_MODE else logging.INFO)
@@ -1136,6 +1143,18 @@ async def debounced_auto_buy(key: str):
             else:
                 last_err = res
                 logger.warning(f"Batch buy attempt failed for {name} at {tgt_price/1000.0:.3f}: {res}")
+                err_text = str(res).lower()
+                is_server_7 = (
+                    err_text.strip() == "7"
+                    or "server 7" in err_text
+                    or "error 7" in err_text
+                    or "ошибка сервера 7" in err_text
+                )
+                if is_server_7:
+                    logger.info(
+                        "Skipping invalid cheapest lot due to server error 7; trying next offer in batch"
+                    )
+                    continue
                 break
 
         if bought_count:
@@ -1766,159 +1785,95 @@ async def poll_telegram_updates():
                             except Exception:
                                 logger.exception("Failed to handle /stats")
                                 await send_simple_message(tg_session, chat_id_msg, "Failed to build stats report")
-                        elif text_msg.startswith("/history"):
-                            # Получение истории покупок через API и отправка текстового отчета (CSV)
+                        elif text_msg.startswith("/history_terminal_success") or text_msg.startswith("/history_day") or text_msg.startswith("/history_all") or text_msg.startswith("/history_from") or text_msg.startswith("/history"):
+                            # Supported commands:
+                            # /history_terminal_success [DD.MM.YYYY] [DD.MM.YYYY]
+                            # /history_day
+                            # /history_all
+                            # /history_from DD.MM.YYYY [DD.MM.YYYY]
+                            # /history day|all
                             try:
-                                candidates = [
-                                    "https://market.csgo.com/api/v2/get-buy-history",
-                                    "https://market.csgo.com/api/v2/buy-history",
-                                    "https://market.csgo.com/api/v2/get-history",
-                                    "https://market.csgo.com/api/v2/history",
-                                    "https://market.csgo.com/api/v2/my/buy-history",
-                                ]
-                                all_entries = []
-                                status = None
-                                raw = None
-                                async with aiohttp.ClientSession() as _local_hist_session:
-                                    for url_hist in candidates:
+                                cmd = (text_msg or "").strip().lower()
+                                scope = None
+                                if cmd.startswith("/history_terminal_success"):
+                                    parts_raw = (text_msg or "").strip().split()
+                                    if len(parts_raw) == 1:
+                                        lt = time.localtime(int(time.time()))
+                                        start_ts = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, lt.tm_wday, lt.tm_yday, lt.tm_isdst)))
+                                        end_ts = int(time.time())
+                                        label = "terminal success today"
+                                    else:
                                         try:
-                                            resp = await _local_hist_session.get(url_hist, params={"key": API_KEY}, timeout=20)
-                                            status = resp.status
-                                            raw = await resp.text()
-                                            try:
-                                                data = json.loads(raw)
-                                            except Exception:
-                                                data = None
-                                            logger.debug(f"/history tried {url_hist} status={status} snippet={raw[:500]}")
-                                            if isinstance(data, dict):
-                                                entries = data.get("items") or data.get("data") or data.get("result") or []
-                                            elif isinstance(data, list):
-                                                entries = data
-                                            else:
-                                                entries = []
-                                            if not entries:
-                                                # try to interpret raw as a JSON array
-                                                try:
-                                                    parsed = json.loads(raw)
-                                                    if isinstance(parsed, list):
-                                                        entries = parsed
-                                                except Exception:
-                                                    pass
-                                            if entries:
-                                                all_entries.extend(entries)
-                                                # try simple paging: numeric pages if total/per_page present
-                                                if isinstance(data, dict):
-                                                    total = data.get("total") or data.get("count") or data.get("size")
-                                                    per_page = data.get("per_page") or data.get("perPage") or data.get("limit") or data.get("page_size")
-                                                    if total and per_page:
-                                                        try:
-                                                            total_i = int(total)
-                                                            per_i = int(per_page)
-                                                            pages = min((total_i + per_i - 1) // per_i, 200)
-                                                        except Exception:
-                                                            pages = 1
-                                                        for p in range(2, pages + 1):
-                                                            try:
-                                                                rpage = await _local_hist_session.get(url_hist, params={"key": API_KEY, "page": p}, timeout=20)
-                                                                txt = await rpage.text()
-                                                                try:
-                                                                    dpage = json.loads(txt)
-                                                                except Exception:
-                                                                    dpage = None
-                                                                if isinstance(dpage, dict):
-                                                                    more = dpage.get("items") or dpage.get("data") or dpage.get("result") or []
-                                                                elif isinstance(dpage, list):
-                                                                    more = dpage
-                                                                else:
-                                                                    more = []
-                                                                if more:
-                                                                    all_entries.extend(more)
-                                                            except Exception:
-                                                                logger.exception(f"Failed to fetch page {p} for {url_hist}")
-                                                                break
-                                                # try following next link if present
-                                                if isinstance(data, dict):
-                                                    next_url = data.get("next") or (data.get("links") and data.get("links").get("next"))
-                                                    cur = next_url
-                                                    while cur and isinstance(cur, str):
-                                                        try:
-                                                            rnext = await _local_hist_session.get(cur, timeout=20)
-                                                            txt = await rnext.text()
-                                                            try:
-                                                                dnext = json.loads(txt)
-                                                            except Exception:
-                                                                dnext = None
-                                                            if isinstance(dnext, dict):
-                                                                more = dnext.get("items") or dnext.get("data") or dnext.get("result") or []
-                                                                if more:
-                                                                    all_entries.extend(more)
-                                                                cur = dnext.get("next") or (dnext.get("links") and dnext.get("links").get("next"))
-                                                            else:
-                                                                break
-                                                        except Exception:
-                                                            logger.exception("Failed to fetch next page for history")
-                                                            break
-                                                break
+                                            start_ts = parse_history_date_to_ts(parts_raw[1])
+                                            end_ts = int(time.time())
+                                            if len(parts_raw) >= 3:
+                                                end_ts = parse_history_date_to_ts(parts_raw[2]) + 86399
+                                            if end_ts < start_ts:
+                                                await send_simple_message(tg_session, chat_id_msg, "End date must be >= start date")
+                                                continue
+                                            label = f"terminal success from {parts_raw[1]}" + (f" to {parts_raw[2]}" if len(parts_raw) >= 3 else " to now")
                                         except Exception:
-                                            logger.exception(f"Error while requesting {url_hist}")
-
-                                if not all_entries:
-                                    snippet = (raw[:500] + '...') if raw else '<empty response>'
-                                    await send_simple_message(tg_session, chat_id_msg, f"История покупок недоступна (status {status}). Ответ сервера: {snippet}")
-                                    return
-
-                                # Filter to purchases only, then write to CSV and send as document
-                                purchases = [e for e in all_entries if is_purchase_entry(e)]
-                                # If heuristics missed entries but API clearly marks buys with 'event':'buy', try that as fallback
-                                if not purchases:
-                                    for e in all_entries:
-                                        try:
-                                            if isinstance(e, dict) and str(e.get('event', '')).lower() == 'buy':
-                                                purchases.append(e)
-                                        except Exception:
+                                            await send_simple_message(tg_session, chat_id_msg, "Usage: /history_terminal_success [DD.MM.YYYY] [DD.MM.YYYY]")
                                             continue
 
-                                # If still empty, fallback to original all_entries to aid debugging
-                                write_entries = purchases if purchases else all_entries
+                                    await send_simple_message(tg_session, chat_id_msg, f"Preparing history export ({label})...")
+                                    await export_operation_history_to_csv(
+                                        tg_session,
+                                        chat_id_msg,
+                                        scope="custom",
+                                        start_ts=start_ts,
+                                        end_ts=end_ts,
+                                        scope_label=label,
+                                        success_buys_only=True,
+                                        target_only=True,
+                                        pretty=True,
+                                    )
+                                    continue
+                                elif cmd.startswith("/history_day"):
+                                    scope = "day"
+                                elif cmd.startswith("/history_all"):
+                                    scope = "all"
+                                elif cmd.startswith("/history_from"):
+                                    parts_raw = (text_msg or "").strip().split()
+                                    if len(parts_raw) < 2:
+                                        await send_simple_message(tg_session, chat_id_msg, "Usage: /history_from DD.MM.YYYY [DD.MM.YYYY]")
+                                        continue
+                                    try:
+                                        start_ts = parse_history_date_to_ts(parts_raw[1])
+                                        end_ts = int(time.time())
+                                        if len(parts_raw) >= 3:
+                                            end_ts = parse_history_date_to_ts(parts_raw[2]) + 86399
+                                        if end_ts < start_ts:
+                                            await send_simple_message(tg_session, chat_id_msg, "End date must be >= start date")
+                                            continue
+                                        label = f"from {parts_raw[1]} to {parts_raw[2]}" if len(parts_raw) >= 3 else f"from {parts_raw[1]} to now"
+                                        await send_simple_message(tg_session, chat_id_msg, f"Preparing history export ({label})...")
+                                        await export_operation_history_to_csv(
+                                            tg_session,
+                                            chat_id_msg,
+                                            scope="custom",
+                                            start_ts=start_ts,
+                                            end_ts=end_ts,
+                                            scope_label=label,
+                                        )
+                                    except Exception:
+                                        await send_simple_message(tg_session, chat_id_msg, "Invalid date format. Use DD.MM.YYYY, DD-MM-YYYY, or UNIX timestamp")
+                                    continue
+                                else:
+                                    parts = cmd.split()
+                                    if len(parts) >= 2 and parts[1] in ("day", "today"):
+                                        scope = "day"
+                                    elif len(parts) >= 2 and parts[1] in ("all", "full"):
+                                        scope = "all"
+                                    else:
+                                        scope = "day"
 
-                                # Write selected entries to CSV and send as document
-                                ts = int(time.time())
-                                filename = f"purchase_history_{ts}.csv"
-                                filepath = os.path.join(os.getcwd(), filename)
-                                try:
-                                    with open(filepath, "w", encoding="utf-8", newline="") as csvf:
-                                        writer = csv.writer(csvf)
-                                        writer.writerow(["index", "detected_purchase", "name", "price_raw", "price_usd", "offer_id", "raw_json"])
-                                        for i, item in enumerate(write_entries, start=1):
-                                            try:
-                                                detected = bool((isinstance(item, dict) and (is_purchase_entry(item) or extract_price_raw(item) is not None)) or (not isinstance(item, dict) and extract_price_raw(item) is not None))
-                                                if isinstance(item, dict):
-                                                    name = item.get('market_hash_name') or item.get('name') or item.get('hash_name') or str(item.get('id', ''))
-                                                else:
-                                                    name = str(item)
-                                                raw_p = extract_price_raw(item) if isinstance(item, dict) else None
-                                                price_val = normalize_price(raw_p)
-                                                offer_id = extract_offer_id(item) if isinstance(item, dict) else None
-                                                raw_j = json.dumps(item, ensure_ascii=False)
-                                                writer.writerow([i, detected, name, raw_p if raw_p is not None else "", f"{price_val:.3f}" if price_val is not None else "", offer_id if offer_id is not None else "", raw_j])
-                                            except Exception:
-                                                writer.writerow([i, False, "<malformed>", "", "", "", ""])
-                                except Exception:
-                                    logger.exception("Failed to write purchase CSV")
-                                    await send_simple_message(tg_session, chat_id_msg, "Не удалось сохранить файл истории покупок.")
-                                    return
-
-                                try:
-                                    summary = f"Всего записей в истории: {len(all_entries)}. Обнаружено покупок по heuristics: {sum(1 for _ in all_entries if isinstance(_, dict) and (is_purchase_entry(_) or extract_price_raw(_) is not None))}. Файл с полной историей отправлен."
-                                    await send_simple_message(tg_session, chat_id_msg, summary)
-                                    await send_document(tg_session, chat_id_msg, filepath, filename=filename)
-                                except Exception:
-                                    logger.exception("Failed to send history file")
-                                    await send_simple_message(tg_session, chat_id_msg, "Ошибка при отправке файла истории покупок.")
-                            except Exception:
+                                await send_simple_message(tg_session, chat_id_msg, f"Preparing history export ({scope})...")
+                                await export_operation_history_to_csv(tg_session, chat_id_msg, scope=scope)
+                            except Exception as e:
                                 logger.exception("Ошибка при обработке команды /history")
                                 try:
-                                    await send_simple_message(tg_session, chat_id_msg, "Произошла ошибка при получении истории покупок.")
+                                    await send_simple_message(tg_session, chat_id_msg, f"Ошибка при получении истории: {str(e)[:220]}")
                                 except Exception:
                                     logger.exception("Failed to notify user about /history error")
             except Exception as e:
@@ -2041,6 +1996,419 @@ async def send_document(session, chat_id, file_path, filename=None):
     except Exception:
         logger.exception("Failed to send document")
         return {"ok": False, "error": "exception"}
+
+
+def _history_event_name(entry):
+    try:
+        return str((entry or {}).get("event") or "unknown").lower()
+    except Exception:
+        return "unknown"
+
+
+def _history_entry_time(entry):
+    try:
+        val = (entry or {}).get("time")
+        if val is None:
+            val = (entry or {}).get("settlement")
+        return int(float(val)) if val is not None else 0
+    except Exception:
+        return 0
+
+
+def _history_entries_from_payload(payload):
+    if isinstance(payload, dict):
+        return payload.get("data") or payload.get("items") or payload.get("result") or []
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+def _history_dedupe_key(entry):
+    try:
+        if not isinstance(entry, dict):
+            return json.dumps(entry, ensure_ascii=False, sort_keys=True)
+        return "|".join([
+            str(entry.get("time") or ""),
+            str(entry.get("event") or ""),
+            str(entry.get("item_id") or entry.get("id") or ""),
+            str(entry.get("market_hash_name") or ""),
+            str(entry.get("paid") or entry.get("received") or entry.get("amount") or ""),
+        ])
+    except Exception:
+        return str(entry)
+
+
+def _safe_int(v, default=0):
+    try:
+        if v is None or v == "":
+            return default
+        return int(float(v))
+    except Exception:
+        return default
+
+
+def _stage_label(stage_val):
+    s = str(stage_val)
+    if s == "1":
+        return "new"
+    if s == "2":
+        return "item_given"
+    if s == "5":
+        return "timed_out"
+    return s or "unknown"
+
+
+def _format_ts(ts_val):
+    ts = _safe_int(ts_val, 0)
+    if ts <= 0:
+        return ""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    except Exception:
+        return str(ts)
+
+
+def _is_target_name(name: str):
+    norm = normalize_name(name or "")
+    if not norm:
+        return False
+    for t in TARGET_MARKET_HASHES:
+        tn = normalize_name(t)
+        if not tn:
+            continue
+        if tn == norm or tn in norm or norm in tn:
+            return True
+    return False
+
+
+def _entry_is_success_buy(item, target_only: bool = False):
+    if not isinstance(item, dict):
+        return False
+    ev = str(item.get("event") or "").lower()
+    if ev != "buy":
+        return False
+    stage = str(item.get("stage") or "")
+    if stage != "2":
+        return False
+    if target_only:
+        name = item.get("market_hash_name") or item.get("name") or ""
+        return _is_target_name(name)
+    return True
+
+
+def parse_history_date_to_ts(raw: str):
+    """Parse date string to UNIX timestamp.
+
+    Supported formats:
+    - DD.MM.YYYY
+    - DD-MM-YYYY
+    - UNIX timestamp (seconds)
+    """
+    s = (raw or "").strip()
+    if not s:
+        raise ValueError("empty date")
+
+    if s.isdigit():
+        # Accept unix timestamp directly.
+        return int(s)
+
+    for fmt in ("%d.%m.%Y", "%d-%m-%Y"):
+        try:
+            tm = time.strptime(s, fmt)
+            return int(time.mktime((tm.tm_year, tm.tm_mon, tm.tm_mday, 0, 0, 0, tm.tm_wday, tm.tm_yday, tm.tm_isdst)))
+        except Exception:
+            continue
+
+    raise ValueError("unsupported date format")
+
+
+async def fetch_history_range(session_obj, endpoint: str, start_ts: int, end_ts: int, depth: int = 0):
+    """Fetch history endpoint for [start_ts, end_ts] with adaptive splitting."""
+    if end_ts < start_ts:
+        return [], 0, 0
+
+    req_count = 0
+    payload = None
+    ok = False
+    attempts = max(1, HISTORY_FETCH_RETRIES)
+    for attempt in range(1, attempts + 1):
+        status, text, _ct = await market_get_text(
+            session_obj,
+            endpoint,
+            params={"key": API_KEY, "date": int(start_ts), "date_end": int(end_ts)},
+            timeout=25,
+        )
+        req_count += 1
+
+        if status != 200:
+            logger.warning(f"History endpoint HTTP {status} for range {start_ts}-{end_ts} (attempt {attempt}/{attempts}): {text[:200]}")
+            if attempt < attempts:
+                await asyncio.sleep(HISTORY_RETRY_BASE_SEC * attempt)
+            continue
+
+        try:
+            payload = json.loads(text)
+        except Exception:
+            logger.warning(f"History endpoint non-JSON for range {start_ts}-{end_ts} (attempt {attempt}/{attempts}): {text[:200]}")
+            if attempt < attempts:
+                await asyncio.sleep(HISTORY_RETRY_BASE_SEC * attempt)
+            continue
+
+        if isinstance(payload, dict) and payload.get("success") is False:
+            logger.warning(f"History endpoint returned success=false for range {start_ts}-{end_ts} (attempt {attempt}/{attempts}): {str(payload)[:300]}")
+            if attempt < attempts:
+                await asyncio.sleep(HISTORY_RETRY_BASE_SEC * attempt)
+            continue
+
+        ok = True
+        break
+
+    if not ok or payload is None:
+        # Mark range as failed so caller can report partial result.
+        return [], req_count, 1
+
+    entries = _history_entries_from_payload(payload)
+    if not isinstance(entries, list):
+        entries = []
+
+    span = int(end_ts) - int(start_ts)
+    should_split_by_span = (
+        HISTORY_MAX_RANGE_SEC > 0
+        and span > HISTORY_MAX_RANGE_SEC
+        and depth < HISTORY_MAX_SPLIT_DEPTH
+    )
+    should_split_by_density = (
+        len(entries) >= HISTORY_SPLIT_THRESHOLD
+        and span > HISTORY_MIN_SPLIT_SEC
+        and depth < HISTORY_MAX_SPLIT_DEPTH
+    )
+
+    if should_split_by_span or should_split_by_density:
+        mid = int(start_ts + (span // 2))
+        left, left_req, left_failed = await fetch_history_range(session_obj, endpoint, int(start_ts), mid, depth + 1)
+        right, right_req, right_failed = await fetch_history_range(session_obj, endpoint, mid + 1, int(end_ts), depth + 1)
+        req_count += left_req + right_req
+
+        merged = []
+        seen = set()
+        for item in left + right:
+            k = _history_dedupe_key(item)
+            if k in seen:
+                continue
+            seen.add(k)
+            merged.append(item)
+        return merged, req_count, (left_failed + right_failed)
+
+    return entries, req_count, 0
+
+
+async def fetch_operation_history_range(session_obj, start_ts: int, end_ts: int, depth: int = 0):
+    return await fetch_history_range(
+        session_obj,
+        "https://market.csgo.com/api/v2/operation-history",
+        start_ts,
+        end_ts,
+        depth,
+    )
+
+
+async def fetch_trade_history_range(session_obj, start_ts: int, end_ts: int, depth: int = 0):
+    return await fetch_history_range(
+        session_obj,
+        "https://market.csgo.com/api/v2/history",
+        start_ts,
+        end_ts,
+        depth,
+    )
+
+
+async def export_operation_history_to_csv(
+    tg_session,
+    chat_id: str,
+    scope: str,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+    scope_label: str | None = None,
+    success_buys_only: bool = False,
+    target_only: bool = False,
+    pretty: bool = False,
+):
+    """Export operation-history by scope: day|all|custom."""
+    now_ts = int(time.time())
+    if start_ts is None or end_ts is None:
+        if scope == "day":
+            lt = time.localtime(now_ts)
+            start_ts = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, lt.tm_wday, lt.tm_yday, lt.tm_isdst)))
+            end_ts = now_ts
+        else:
+            start_ts = int(now_ts - (HISTORY_ALL_LOOKBACK_DAYS * 86400))
+            end_ts = now_ts
+
+    if end_ts < start_ts:
+        raise ValueError("end date is earlier than start date")
+
+    scope_text = scope_label or scope
+
+    await init_session()
+    s = session
+
+    source_endpoint = "operation-history"
+    entries, req_count, failed_ranges = await fetch_operation_history_range(s, start_ts, end_ts)
+    # Fallback for providers/accounts where operation-history can be sparse on wide ranges.
+    if not entries and (scope == "all" or scope == "custom"):
+        try:
+            entries_alt, req_alt, failed_alt = await fetch_trade_history_range(s, start_ts, end_ts)
+            req_count += req_alt
+            failed_ranges += failed_alt
+            if entries_alt:
+                entries = entries_alt
+                source_endpoint = "history"
+        except Exception:
+            logger.exception("Fallback /history request failed")
+
+    # For accuracy in filtered target-success mode, merge both sources and dedupe.
+    if success_buys_only and target_only and (scope == "all" or scope == "custom"):
+        try:
+            entries_alt2, req_alt2, failed_alt2 = await fetch_trade_history_range(s, start_ts, end_ts)
+            req_count += req_alt2
+            failed_ranges += failed_alt2
+            if entries_alt2:
+                merged = []
+                seen = set()
+                for it in entries + entries_alt2:
+                    k = _history_dedupe_key(it)
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    merged.append(it)
+                entries = merged
+                source_endpoint = "operation-history+history"
+        except Exception:
+            logger.exception("Merge fallback /history request failed")
+
+    if not entries:
+        await send_simple_message(
+            tg_session,
+            chat_id,
+            f"История пуста для диапазона {scope_text}. Попробуй уменьшить окно (например /history_day) или указать конкретную дату через /history_from DD.MM.YYYY.",
+        )
+        return
+
+    if success_buys_only:
+        filtered = [e for e in entries if _entry_is_success_buy(e, target_only=target_only)]
+        entries = filtered
+        if not entries:
+            what = "успешные покупки" + (" по целевым предметам" if target_only else "")
+            await send_simple_message(tg_session, chat_id, f"За диапазон {scope_text} не найдено: {what}.")
+            return
+
+    entries = sorted(entries, key=_history_entry_time, reverse=True)
+    buys = sum(1 for e in entries if _history_event_name(e) == "buy")
+    sells = sum(1 for e in entries if _history_event_name(e) == "sell")
+    checkouts = sum(1 for e in entries if _history_event_name(e) == "checkout")
+    total_paid_units = sum(_safe_int((e or {}).get("paid") or (e or {}).get("price"), 0) for e in entries if isinstance(e, dict))
+
+    ts = int(time.time())
+    suffix = ""
+    if success_buys_only and target_only:
+        suffix = "_terminal_success"
+    elif success_buys_only:
+        suffix = "_success_buys"
+    filename = f"operation_history_{scope}{suffix}_{ts}.csv"
+    filepath = os.path.join(os.getcwd(), filename)
+    with open(filepath, "w", encoding="utf-8", newline="") as csvf:
+        writer = csv.writer(csvf)
+        if pretty:
+            writer.writerow([
+                "datetime",
+                "item",
+                "paid_usd",
+                "stage",
+                "app",
+                "item_id",
+                "settlement_datetime",
+            ])
+        else:
+            writer.writerow([
+                "time",
+                "event",
+                "market_hash_name",
+                "item_id",
+                "app",
+                "stage",
+                "settlement",
+                "paid",
+                "received",
+                "amount",
+                "currency",
+                "causer",
+                "refund_seller",
+                "refund_market",
+                "raw_json",
+            ])
+        for item in entries:
+            if not isinstance(item, dict):
+                if pretty:
+                    writer.writerow(["", "", "", "", "", "", ""])
+                else:
+                    writer.writerow(["", "", "", "", "", "", "", "", "", "", "", "", "", "", json.dumps(item, ensure_ascii=False)])
+                continue
+            refund = item.get("refund") or {}
+            refund_seller = None
+            refund_market = None
+            try:
+                if isinstance(refund, dict):
+                    refund_seller = (refund.get("seller") or {}).get("amount")
+                    refund_market = (refund.get("market") or {}).get("amount")
+            except Exception:
+                pass
+            if pretty:
+                paid_units = _safe_int(item.get("paid") or item.get("price"), 0)
+                writer.writerow([
+                    _format_ts(item.get("time")),
+                    item.get("market_hash_name") or item.get("name") or "",
+                    f"{paid_units/1000.0:.3f}",
+                    _stage_label(item.get("stage")),
+                    item.get("app"),
+                    item.get("item_id") or item.get("id"),
+                    _format_ts(item.get("settlement")),
+                ])
+            else:
+                writer.writerow([
+                    item.get("time"),
+                    item.get("event"),
+                    item.get("market_hash_name"),
+                    item.get("item_id") or item.get("id"),
+                    item.get("app"),
+                    item.get("stage"),
+                    item.get("settlement"),
+                    item.get("paid") or item.get("price"),
+                    item.get("received"),
+                    item.get("amount"),
+                    item.get("currency"),
+                    item.get("causer"),
+                    refund_seller,
+                    refund_market,
+                    json.dumps(item, ensure_ascii=False),
+                ])
+
+    mode_label = "success-buys" if success_buys_only else "all-events"
+    if success_buys_only and target_only:
+        mode_label = "terminal-success"
+    summary = (
+        f"History scope={scope_text}. Mode={mode_label}. Entries: {len(entries)}. "
+        f"buy={buys}, sell={sells}, checkout={checkouts}. "
+        f"total_paid=${total_paid_units/1000.0:.3f}. source={source_endpoint}. API requests: {req_count}."
+    )
+    if failed_ranges > 0:
+        summary += f" WARNING: partial result, failed_ranges={failed_ranges}."
+    await send_simple_message(tg_session, chat_id, summary)
+    await send_document(tg_session, chat_id, filepath, filename=filename)
+
+    try:
+        os.remove(filepath)
+    except Exception:
+        pass
 
 async def get_balance():
     """Fetch balance from the API."""
