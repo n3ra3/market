@@ -69,6 +69,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("MARKET_TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("MARKET_TELEGRAM_CHAT_ID")
 WS_URL = "wss://wsprice.csgo.com/connection/websocket"
 REST_PRICES_URL = "https://market.csgo.com/api/v2/prices/USD.json"
+SEARCH_ITEM_SPECIFIC_URL = "https://market.csgo.com/api/v2/search-item-by-hash-name-specific"
 GET_WS_TOKEN_URL = "https://market.csgo.com/api/v2/get-ws-token"
 WS_ORIGIN = os.getenv("WS_ORIGIN", "https://market.csgo.com")
 WS_USER_AGENT = os.getenv("WS_USER_AGENT", "market-bot/1.0")
@@ -77,6 +78,9 @@ WS_USER_AGENT = os.getenv("WS_USER_AGENT", "market-bot/1.0")
 # Fallback polling interval in seconds (default 10). Lower -> more REST requests.
 # You can override via environment variable `POLL_INTERVAL` on Render.
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "2"))  # Updated to 2 seconds for safe API usage
+# While WS is degraded, use a short fallback interval for a limited window.
+FAST_FALLBACK_INTERVAL_SEC = float(os.getenv("FAST_FALLBACK_INTERVAL_SEC", "1.0"))
+FAST_FALLBACK_WINDOW_SEC = int(os.getenv("FAST_FALLBACK_WINDOW_SEC", "20"))
 # Dedupe bucket size in seconds (used to group similar alerts). Default 120 (2 minutes).
 # Lowering this reduces grouping window so similar-priced alerts are treated sooner.
 DEDUPE_BUCKET_SEC = int(os.getenv("DEDUPE_BUCKET_SEC", "60"))
@@ -89,6 +93,14 @@ AUTO_RECHECK_INTERVAL_SEC = float(os.getenv("AUTO_RECHECK_INTERVAL_SEC", "2"))
 # Maximum number of lots to buy in one aggregated AUTO window (0 = disabled).
 # Set >0 to allow small batch purchases when many offers appear simultaneously.
 MAX_BATCH_BUY = int(os.getenv("MAX_BATCH_BUY", "0"))
+# Fast offer fetch tuning: keep AUTO responsive under flaky provider responses.
+OFFER_FETCH_TIMEOUT_SEC = float(os.getenv("OFFER_FETCH_TIMEOUT_SEC", "6"))
+OFFER_FETCH_RETRIES = int(os.getenv("OFFER_FETCH_RETRIES", "1"))
+OFFER_FETCH_RETRY_DELAY_SEC = float(os.getenv("OFFER_FETCH_RETRY_DELAY_SEC", "0.25"))
+# Temporary cooldown for problematic lot IDs (seconds).
+FAILED_OFFER_COOLDOWN_SEC = int(os.getenv("FAILED_OFFER_COOLDOWN_SEC", "20"))
+# Balance cache for fast AUTO loops (seconds). 0 disables cache.
+BALANCE_CACHE_TTL_SEC = float(os.getenv("BALANCE_CACHE_TTL_SEC", "2.0"))
 # Purchase log and spend limits
 PURCHASE_LOG = os.path.join(os.getcwd(), "purchase_history.csv")
 DAILY_SPEND_LIMIT_USD = float(os.getenv("DAILY_SPEND_LIMIT_USD", "0"))  # 0 = disabled
@@ -130,6 +142,7 @@ _last_state_save_ts = 0
 _last_balance_error_log_ts = 0
 _last_known_balance_usd = None
 _last_known_balance_ts = 0
+_ws_last_error_ts = 0.0
 _market_last_request_ts = 0.0
 _market_rate_lock = asyncio.Lock()
 
@@ -383,6 +396,8 @@ PROCESSED_FILE = os.path.join(os.getcwd(), "processed_ids.json")
 processed_ids = {}  # dict[str->int]
 # TTL for processed ids (seconds)
 PROCESSED_TTL = int(os.getenv("PROCESSED_TTL", str(10 * 60)))  # default 10 minutes
+# In-memory cooldown map for problematic offer ids: {"<id>": unix_expire_ts}
+failed_offer_cooldowns = {}
 
 
 # Добавлена функция ensure_storage_files для проверки и создания необходимых файлов
@@ -531,6 +546,62 @@ def add_processed_offer(offer_id):
         save_processed_ids()
     except Exception:
         logger.exception("Failed to add processed offer")
+
+
+def should_cooldown_offer_error(err) -> bool:
+    """Return True for transient lot-specific failures worth temporary offer-id cooldown."""
+    try:
+        s = str(err or "").lower()
+        if not s:
+            return False
+        # Typical poisoned/missing lot failures from provider.
+        patterns = (
+            "error 7",
+            "server error 7",
+            "ошибка сервера 7",
+            "не найден предмет",
+            "not found",
+            "item not found",
+            "listing not found",
+        )
+        return any(p in s for p in patterns)
+    except Exception:
+        return False
+
+
+def is_offer_on_cooldown(offer_id) -> bool:
+    try:
+        if offer_id is None:
+            return False
+        key = str(int(offer_id))
+        exp = float(failed_offer_cooldowns.get(key, 0) or 0)
+        if exp <= 0:
+            return False
+        now = time.time()
+        if now >= exp:
+            failed_offer_cooldowns.pop(key, None)
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def mark_offer_cooldown(offer_id, reason: str = ""):
+    try:
+        if offer_id is None or FAILED_OFFER_COOLDOWN_SEC <= 0:
+            return
+        key = str(int(offer_id))
+        exp = time.time() + int(FAILED_OFFER_COOLDOWN_SEC)
+        failed_offer_cooldowns[key] = exp
+        # Keep memory bounded by pruning expired entries opportunistically.
+        if len(failed_offer_cooldowns) > 2000:
+            now = time.time()
+            for k, v in list(failed_offer_cooldowns.items()):
+                if float(v or 0) <= now:
+                    failed_offer_cooldowns.pop(k, None)
+        logger.debug("Offer id %s cooldown set for %ss (%s)", key, FAILED_OFFER_COOLDOWN_SEC, str(reason)[:120])
+    except Exception:
+        logger.exception("Failed to mark offer cooldown")
 
 
 def make_item_key_from_raw(raw: dict) -> str:
@@ -949,6 +1020,8 @@ async def websocket_listener():
 
         except Exception as e:
             logger.error(f"WebSocket error: {e}")
+            global _ws_last_error_ts
+            _ws_last_error_ts = time.monotonic()
             # For token-fetch failures, retry faster to reduce blind time.
             err_text = str(e).lower()
             if "ws_token" in err_text:
@@ -1016,12 +1089,23 @@ async def fallback_polling():
         except Exception as e:
             logger.error(f"Polling error: {e}")
 
-        await asyncio.sleep(POLL_INTERVAL)
+        # Poll faster for a short period right after WS errors, then return to base cadence.
+        sleep_sec = float(POLL_INTERVAL)
+        try:
+            if FAST_FALLBACK_WINDOW_SEC > 0:
+                since_ws_error = time.monotonic() - float(_ws_last_error_ts or 0.0)
+                if 0.0 <= since_ws_error <= float(FAST_FALLBACK_WINDOW_SEC):
+                    sleep_sec = max(0.2, min(float(POLL_INTERVAL), float(FAST_FALLBACK_INTERVAL_SEC)))
+        except Exception:
+            sleep_sec = float(POLL_INTERVAL)
+        await asyncio.sleep(sleep_sec)
 
 # Temporary storage for pending offers
 pending_offers = {}
 # Last AUTO trigger timestamps by normalized item name
 last_auto_trigger_ts = {}
+# In-flight AUTO workers by normalized item name to avoid duplicate concurrent buys.
+auto_inflight_names = set()
 
 # Helper: enqueue offers for debounced AUTO buying
 def enqueue_pending_auto(name: str, price_units: int, threshold_units: int = None, raw: dict | None = None):
@@ -1047,6 +1131,7 @@ def enqueue_pending_auto(name: str, price_units: int, threshold_units: int = Non
 async def debounced_auto_buy(key: str):
     """Wait DEBOUNCE_SEC seconds and attempt a single purchase for aggregated offers keyed by name|bucket."""
     start_time = time.time()
+    inflight_norm = None
     logger.info(f"Debounced auto-buy started for key={key} at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}")
     try:
         await asyncio.sleep(DEBOUNCE_SEC)
@@ -1054,6 +1139,11 @@ async def debounced_auto_buy(key: str):
         if not entry:
             return
         name = entry.get("name")
+        inflight_norm = normalize_name(name or "")
+        if inflight_norm in auto_inflight_names:
+            logger.info("Debounced AUTO buy skipped for %s: another worker is already in-flight", name)
+            return
+        auto_inflight_names.add(inflight_norm)
         bucket = entry.get("bucket")
         offers = entry.get("offers", [])
         if not offers:
@@ -1092,7 +1182,12 @@ async def debounced_auto_buy(key: str):
         # Decide how many to attempt: if MAX_BATCH_BUY <= 0 -> buy all available; otherwise cap
         available = len(offers_now)
         if available == 0:
-            to_buy = 1
+            logger.info(
+                "Debounced AUTO buy skipped for %s: no concrete offers returned under threshold %.3f",
+                name,
+                threshold_units / 1000.0,
+            )
+            return
         elif MAX_BATCH_BUY <= 0:
             to_buy = available
         else:
@@ -1103,25 +1198,35 @@ async def debounced_auto_buy(key: str):
         purchases_made = []
         tried_count = 0
         failed_count = 0
+        cooldown_skipped = 0
+        # One fast balance precheck for the whole batch to avoid per-lot latency.
+        try:
+            current_balance = await check_balance()
+        except Exception:
+            current_balance = None
+        if current_balance is None:
+            logger.warning("Balance precheck unavailable before batch buy; proceeding to buy endpoint")
+        local_balance = current_balance
         for i in range(to_buy):
             if state.get("mode") != "AUTO":
                 logger.warning("Aborting batch buy: mode switched from AUTO")
                 break
             target_offer = offers_now[i] if i < len(offers_now) else cheapest
             tgt_price = int(target_offer.get("price_units", price_units))
+            buy_price_limit = int(threshold_units or tgt_price)
+            offer_id_for_buy = target_offer.get("offer_id") if isinstance(target_offer, dict) else None
+
+            # Skip recently poisoned/vanished lots for a short cooldown window.
+            if is_offer_on_cooldown(offer_id_for_buy):
+                cooldown_skipped += 1
+                continue
+
             tried_count += 1
 
-            # Re-check real balance before attempting each purchase to avoid "Not money" races
-            try:
-                current_balance = await check_balance()
-            except Exception:
-                current_balance = None
-            if current_balance is not None and current_balance < (tgt_price / 1000.0):
-                logger.warning(f"Batch buy stopped: insufficient balance for next lot. needed={tgt_price/1000.0:.3f}, balance={current_balance:.3f}")
-                last_err = f"insufficient_balance:{current_balance}"
+            if local_balance is not None and local_balance < (tgt_price / 1000.0):
+                logger.warning(f"Batch buy stopped: insufficient balance for next lot. needed={tgt_price/1000.0:.3f}, balance={local_balance:.3f}")
+                last_err = f"insufficient_balance:{local_balance}"
                 break
-            if current_balance is None:
-                logger.warning("Balance check unavailable before buy; proceeding to buy endpoint")
 
             # Check spend limits stored in state
             allowed, reason = can_spend(tgt_price / 1000.0)
@@ -1131,13 +1236,26 @@ async def debounced_auto_buy(key: str):
                 break
 
             # Attempt purchase
-            ok, res = await buy_item(name, tgt_price, source="auto", raw=target_offer.get("raw") if isinstance(target_offer, dict) else None)
+            ok, res = await buy_item(
+                name,
+                buy_price_limit,
+                source="auto",
+                raw=target_offer.get("raw") if isinstance(target_offer, dict) else None,
+                offer_id=offer_id_for_buy,
+            )
             if ok:
                 bought_count += 1
+                if local_balance is not None:
+                    local_balance = max(0.0, local_balance - (buy_price_limit / 1000.0))
                 try:
-                    purchases_made.append({"price_units": tgt_price, "id": res, "ts": int(time.time())})
+                    purchases_made.append({
+                        "price_units": buy_price_limit,
+                        "signal_price_units": tgt_price,
+                        "id": res,
+                        "ts": int(time.time()),
+                    })
                 except Exception:
-                    purchases_made.append({"price_units": tgt_price, "id": res})
+                    purchases_made.append({"price_units": buy_price_limit, "signal_price_units": tgt_price, "id": res})
                 # Small delay between successive buys to reduce race with other buyers/provider throttling
                 try:
                     await asyncio.sleep(0.4)
@@ -1146,16 +1264,32 @@ async def debounced_auto_buy(key: str):
             else:
                 last_err = res
                 failed_count += 1
-                logger.warning(f"Batch buy attempt failed for {name} at {tgt_price/1000.0:.3f}: {res}")
+                if isinstance(res, str) and "not money" in res.lower():
+                    try:
+                        refreshed = await check_balance(force_refresh=True)
+                    except Exception:
+                        refreshed = None
+                    if refreshed is not None:
+                        local_balance = refreshed
+                    logger.warning("Batch buy stopping after Not money to avoid extra failed buy requests")
+                    break
+
+                # Temporarily cool down problematic lot IDs so the scanner can move on.
+                if offer_id_for_buy is not None and should_cooldown_offer_error(res):
+                    mark_offer_cooldown(offer_id_for_buy, reason=str(res))
+                logger.warning(
+                    f"Batch buy attempt failed for {name}: signal={tgt_price/1000.0:.3f}, limit={buy_price_limit/1000.0:.3f}, err={res}"
+                )
                 # Keep scanning all available offers below threshold in this batch.
                 continue
 
         logger.info(
-            "Batch scan summary for %s: tried=%s bought=%s failed=%s available=%s",
+            "Batch scan summary for %s: tried=%s bought=%s failed=%s cooldown_skipped=%s available=%s",
             name,
             tried_count,
             bought_count,
             failed_count,
+            cooldown_skipped,
             available,
         )
 
@@ -1177,10 +1311,11 @@ async def debounced_auto_buy(key: str):
                 total = 0.0
                 for idx, p in enumerate(purchases_made, start=1):
                     pu = int(p.get("price_units", 0))
+                    sig_pu = int(p.get("signal_price_units", pu))
                     total += (pu / 1000.0)
                     pid = p.get("id") or "-"
                     tstr = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(p.get("ts", int(time.time()))))
-                    lines.append(f"{idx}. ${pu/1000.0:.3f} id={pid} at {tstr}")
+                    lines.append(f"{idx}. limit=${pu/1000.0:.3f} signal=${sig_pu/1000.0:.3f} id={pid} at {tstr}")
                 lines.append(f"Total: ${total:.3f}")
                 text = "\n".join(lines)
                 # If too long, send as document
@@ -1215,6 +1350,8 @@ async def debounced_auto_buy(key: str):
     except Exception:
         logger.exception("Error in debounced_auto_buy")
     finally:
+        if inflight_norm:
+            auto_inflight_names.discard(inflight_norm)
         end_time = time.time()
         logger.info(f"Debounced auto-buy ended for key={key} at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}")
         logger.info(f"Debounced auto-buy duration: {end_time - start_time:.2f} seconds")
@@ -1227,36 +1364,97 @@ async def fetch_available_offers(name: str, max_price_units: int):
     try:
         await init_session()
         s = session
-        status, text, _ct = await market_get_text(s, REST_PRICES_URL, params={"key": API_KEY}, timeout=20)
-        if status != 200:
-            return []
-        try:
-            data = json.loads(text)
-        except Exception:
-            return []
-
-        if not data.get("success"):
-            return []
-        items = data.get("items") or []
         matches = []
         norm = normalize_name(name)
-        for it in items:
-            try:
-                it_name = it.get("market_hash_name") or it.get("name") or ""
-                if normalize_name(it_name) != norm:
-                    continue
-                raw_price = it.get("price") or it.get("value")
-                if raw_price is None:
-                    continue
-                p = float(raw_price)
-                pu = int(p * 1000)
-                if pu <= int(max_price_units):
-                    offer_id = extract_offer_id(it)
-                    if offer_id and is_processed_offer(offer_id):
-                        continue
-                    matches.append({"price_units": pu, "raw": it, "offer_id": offer_id})
-            except Exception:
+
+        # Primary source: listing-specific endpoint with concrete lot IDs.
+        retries = max(0, int(OFFER_FETCH_RETRIES))
+        for attempt in range(retries + 1):
+            status, text, _ct = await market_get_text(
+                s,
+                SEARCH_ITEM_SPECIFIC_URL,
+                params={"key": API_KEY, "hash_name": name},
+                timeout=OFFER_FETCH_TIMEOUT_SEC,
+            )
+            if status == 200:
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    data = None
+                if isinstance(data, dict) and data.get("success"):
+                    items = data.get("data") or []
+                    for it in items:
+                        try:
+                            if not isinstance(it, dict):
+                                continue
+                            it_name = it.get("market_hash_name") or it.get("name") or ""
+                            if normalize_name(it_name) != norm:
+                                continue
+
+                            raw_price = it.get("price")
+                            if raw_price is None:
+                                continue
+
+                            # specific endpoint usually returns integer units (e.g. 13 => $0.013)
+                            if isinstance(raw_price, str) and "." in raw_price:
+                                pu = int(float(raw_price) * 1000)
+                            else:
+                                pu = int(float(raw_price))
+
+                            if pu <= int(max_price_units):
+                                offer_id = extract_offer_id(it)
+                                if offer_id and is_processed_offer(offer_id):
+                                    continue
+                                if offer_id and is_offer_on_cooldown(offer_id):
+                                    continue
+                                matches.append({"price_units": pu, "raw": it, "offer_id": offer_id})
+                        except Exception:
+                            continue
+                # Retry once even on successful-but-empty response to mitigate transient stale windows.
+                if matches or attempt >= retries:
+                    break
+                await asyncio.sleep(max(0.0, OFFER_FETCH_RETRY_DELAY_SEC))
                 continue
+
+            # Retry quickly only when concrete offers are still unavailable.
+            if attempt < retries:
+                await asyncio.sleep(max(0.0, OFFER_FETCH_RETRY_DELAY_SEC))
+
+        # Fallback source: legacy top-price snapshot endpoint.
+        if not matches:
+            status2, text2, _ct2 = await market_get_text(
+                s,
+                REST_PRICES_URL,
+                params={"key": API_KEY},
+                timeout=OFFER_FETCH_TIMEOUT_SEC,
+            )
+            if status2 == 200:
+                try:
+                    data2 = json.loads(text2)
+                except Exception:
+                    data2 = None
+                if isinstance(data2, dict) and data2.get("success"):
+                    items2 = data2.get("items") or []
+                    for it in items2:
+                        try:
+                            it_name = it.get("market_hash_name") or it.get("name") or ""
+                            if normalize_name(it_name) != norm:
+                                continue
+                            raw_price = it.get("price") or it.get("value")
+                            if raw_price is None:
+                                continue
+                            p = float(raw_price)
+                            pu = int(p * 1000)
+                            if pu <= int(max_price_units):
+                                offer_id = extract_offer_id(it)
+                                if offer_id and is_processed_offer(offer_id):
+                                    continue
+                                if offer_id and is_offer_on_cooldown(offer_id):
+                                    continue
+                                matches.append({"price_units": pu, "raw": it, "offer_id": offer_id})
+                        except Exception:
+                            continue
+
         matches.sort(key=lambda x: x.get("price_units", 10**12))
         return matches
     except Exception:
@@ -2494,10 +2692,16 @@ async def handle_balance_command(session, chat_id):
         await send_simple_message(session, chat_id, "Error fetching balance.")
 
 # Функция для проверки баланса
-async def check_balance():
+async def check_balance(force_refresh: bool = False):
     """Check the current balance, fetching from the API if necessary."""
     global _last_balance_error_log_ts, _last_known_balance_usd, _last_known_balance_ts
     try:
+        # Fast path: reuse very recent balance to reduce latency and request pressure.
+        if not force_refresh and BALANCE_CACHE_TTL_SEC > 0 and _last_known_balance_usd is not None:
+            age = time.time() - float(_last_known_balance_ts or 0)
+            if age >= 0 and age <= float(BALANCE_CACHE_TTL_SEC):
+                return float(_last_known_balance_usd)
+
         await init_session()
         s = session
         status, text, _ct = await market_get_text(
@@ -2579,19 +2783,25 @@ async def buy_cheapest_by_hash_name(hash_name, threshold_units):
         logger.exception("Error during purchase")
         return False, "Error during purchase."
 
-async def buy_item(hash_name: str, price: int, source: str = "manual", raw=None):
+async def buy_item(hash_name: str, price: int, source: str = "manual", raw=None, offer_id=None):
     """Покупка предмета через API market.csgo.com."""
     # Safety: do not allow automatic-source purchases when mode is not AUTO
     try:
         current_mode = state.get("mode", "MANUAL")
     except Exception:
         current_mode = "MANUAL"
-    logger.debug(f"buy_item called: name={hash_name} price={price} source={source} mode={current_mode}")
+    logger.debug(
+        f"buy_item called: name={hash_name} price={price} source={source} mode={current_mode} offer_id={offer_id}"
+    )
     if source == "auto" and current_mode != "AUTO":
         logger.warning(f"Blocked auto purchase for {hash_name} because mode={current_mode}")
         return False, "blocked: manual mode"
     url = f"https://market.csgo.com/api/v2/buy"
-    params = {"key": API_KEY, "hash_name": hash_name, "price": price}
+    params = {"key": API_KEY, "price": price}
+    if offer_id is not None:
+        params["id"] = offer_id
+    else:
+        params["hash_name"] = hash_name
     try:
         # Reuse global session to reduce overhead and keep cookies/headers consistent
         await init_session()
@@ -2633,7 +2843,7 @@ async def buy_item(hash_name: str, price: int, source: str = "manual", raw=None)
         # If provider says Not money, re-check balance to log real balance and avoid blind retries
         if isinstance(err, str) and "Not money" in err:
             try:
-                bal = await check_balance()
+                bal = await check_balance(force_refresh=True)
                 if bal is None:
                     logger.warning("Buy failed due to Not money; balance check unavailable")
                     return False, "Not money; balance=unknown"
