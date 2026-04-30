@@ -97,6 +97,9 @@ MAX_BATCH_BUY = int(os.getenv("MAX_BATCH_BUY", "0"))
 OFFER_FETCH_TIMEOUT_SEC = float(os.getenv("OFFER_FETCH_TIMEOUT_SEC", "6"))
 OFFER_FETCH_RETRIES = int(os.getenv("OFFER_FETCH_RETRIES", "1"))
 OFFER_FETCH_RETRY_DELAY_SEC = float(os.getenv("OFFER_FETCH_RETRY_DELAY_SEC", "0.25"))
+# Max-chance controls for auto-buy attempts.
+ALLOW_BLIND_BUY = os.getenv("ALLOW_BLIND_BUY", "1") in ("1", "true", "True", "yes", "on")
+REFRESH_OFFER_ON_NOT_FOUND = os.getenv("REFRESH_OFFER_ON_NOT_FOUND", "1") in ("1", "true", "True", "yes", "on")
 # Temporary cooldown for problematic lot IDs (seconds).
 FAILED_OFFER_COOLDOWN_SEC = int(os.getenv("FAILED_OFFER_COOLDOWN_SEC", "20"))
 # Balance cache for fast AUTO loops (seconds). 0 disables cache.
@@ -1221,6 +1224,20 @@ async def debounced_auto_buy(key: str):
                 cooldown_skipped += 1
                 continue
 
+            if offer_id_for_buy is None and ALLOW_BLIND_BUY:
+                try:
+                    specific = await fetch_specific_offers(name, buy_price_limit)
+                    if specific:
+                        target_offer = specific[0]
+                        offer_id_for_buy = target_offer.get("offer_id")
+                        tgt_price = int(target_offer.get("price_units", tgt_price))
+                except Exception:
+                    pass
+            elif offer_id_for_buy is None and not ALLOW_BLIND_BUY:
+                logger.warning("Skipping buy without offer_id for %s (blind buy disabled)", name)
+                cooldown_skipped += 1
+                continue
+
             tried_count += 1
 
             if local_balance is not None and local_balance < (tgt_price / 1000.0):
@@ -1277,6 +1294,42 @@ async def debounced_auto_buy(key: str):
                 # Temporarily cool down problematic lot IDs so the scanner can move on.
                 if offer_id_for_buy is not None and should_cooldown_offer_error(res):
                     mark_offer_cooldown(offer_id_for_buy, reason=str(res))
+                # One quick retry: refresh specific offers after not-found errors.
+                if REFRESH_OFFER_ON_NOT_FOUND and should_cooldown_offer_error(res):
+                    try:
+                        refreshed = await fetch_specific_offers(name, buy_price_limit)
+                    except Exception:
+                        refreshed = []
+                    if refreshed:
+                        retry_offer = refreshed[0]
+                        retry_offer_id = retry_offer.get("offer_id")
+                        if retry_offer_id and not is_offer_on_cooldown(retry_offer_id):
+                            tried_count += 1
+                            ok2, res2 = await buy_item(
+                                name,
+                                buy_price_limit,
+                                source="auto",
+                                raw=retry_offer.get("raw"),
+                                offer_id=retry_offer_id,
+                            )
+                            if ok2:
+                                bought_count += 1
+                                if local_balance is not None:
+                                    local_balance = max(0.0, local_balance - (buy_price_limit / 1000.0))
+                                try:
+                                    purchases_made.append({
+                                        "price_units": buy_price_limit,
+                                        "signal_price_units": tgt_price,
+                                        "id": res2,
+                                        "ts": int(time.time()),
+                                    })
+                                except Exception:
+                                    purchases_made.append({"price_units": buy_price_limit, "signal_price_units": tgt_price, "id": res2})
+                                continue
+                            last_err = res2
+                            failed_count += 1
+                            if should_cooldown_offer_error(res2):
+                                mark_offer_cooldown(retry_offer_id, reason=str(res2))
                 logger.warning(
                     f"Batch buy attempt failed for {name}: signal={tgt_price/1000.0:.3f}, limit={buy_price_limit/1000.0:.3f}, err={res}"
                 )
@@ -1463,6 +1516,73 @@ async def fetch_available_offers(name: str, max_price_units: int):
     finally:
         end_time = time.time()
         logger.info(f"fetch_available_offers duration: {end_time - start_time:.2f} seconds")
+
+
+async def fetch_specific_offers(name: str, max_price_units: int):
+    """Fetch listing-specific offers with concrete lot IDs only."""
+    start_time = time.time()
+    try:
+        await init_session()
+        s = session
+        matches = []
+        norm = normalize_name(name)
+        retries = max(0, int(OFFER_FETCH_RETRIES))
+        for attempt in range(retries + 1):
+            status, text, _ct = await market_get_text(
+                s,
+                SEARCH_ITEM_SPECIFIC_URL,
+                params={"key": API_KEY, "hash_name": name},
+                timeout=OFFER_FETCH_TIMEOUT_SEC,
+            )
+            if status == 200:
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    data = None
+                if isinstance(data, dict) and data.get("success"):
+                    items = data.get("data") or []
+                    for it in items:
+                        try:
+                            if not isinstance(it, dict):
+                                continue
+                            it_name = it.get("market_hash_name") or it.get("name") or ""
+                            if normalize_name(it_name) != norm:
+                                continue
+
+                            raw_price = it.get("price")
+                            if raw_price is None:
+                                continue
+
+                            if isinstance(raw_price, str) and "." in raw_price:
+                                pu = int(float(raw_price) * 1000)
+                            else:
+                                pu = int(float(raw_price))
+
+                            if pu <= int(max_price_units):
+                                offer_id = extract_offer_id(it)
+                                if offer_id and is_processed_offer(offer_id):
+                                    continue
+                                if offer_id and is_offer_on_cooldown(offer_id):
+                                    continue
+                                matches.append({"price_units": pu, "raw": it, "offer_id": offer_id})
+                        except Exception:
+                            continue
+                if matches or attempt >= retries:
+                    break
+                await asyncio.sleep(max(0.0, OFFER_FETCH_RETRY_DELAY_SEC))
+                continue
+
+            if attempt < retries:
+                await asyncio.sleep(max(0.0, OFFER_FETCH_RETRY_DELAY_SEC))
+
+        matches.sort(key=lambda x: x.get("price_units", 10**12))
+        return matches
+    except Exception:
+        logger.exception("Failed to fetch specific offers")
+        return []
+    finally:
+        end_time = time.time()
+        logger.info(f"fetch_specific_offers duration: {end_time - start_time:.2f} seconds")
 
 # Update process_event to handle the cheapest lot logic
 def process_event(event):
