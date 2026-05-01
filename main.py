@@ -52,6 +52,8 @@ TARGET_MARKET_HASHES = [t.strip() for t in _targets_env.split(",") if t.strip()]
 # Default threshold from env (USD) -> units where 1 USD = 1000.
 DEFAULT_THRESHOLD_USD = float(os.getenv("DEFAULT_THRESHOLD_USD", "0.29"))
 THRESHOLD = int(round(DEFAULT_THRESHOLD_USD * 1000))
+# Force env threshold for tests (ignores floating thresholds/custom requirement).
+FORCE_ENV_THRESHOLD = os.getenv("FORCE_ENV_THRESHOLD", "0") in ("1", "true", "True", "yes", "on")
 # Hard safety cap from env (USD). If 0, cap is disabled.
 HARD_MAX_BUY_PRICE_USD = float(os.getenv("HARD_MAX_BUY_PRICE_USD", "0"))
 HARD_MAX_BUY_UNITS = int(round(HARD_MAX_BUY_PRICE_USD * 1000)) if HARD_MAX_BUY_PRICE_USD > 0 else 0
@@ -1649,17 +1651,20 @@ def process_event(event):
         floating_margin = float(state.get("floating_margin_pct", 0.10))
 
         cfg_threshold = state.get("thresholds", {}).get(norm)
-        if REQUIRE_EXPLICIT_THRESHOLD and cfg_threshold is None:
-            metrics_inc("skip_filtered_ws")
-            logger.debug(f"WS skip for '{name}': explicit per-item threshold required")
-            return
-        try:
-            if cfg_threshold is not None:
-                effective_threshold_units = int(cfg_threshold)
-            else:
-                effective_threshold_units = int(baseline * (1.0 - floating_margin))
-        except Exception:
+        if FORCE_ENV_THRESHOLD:
             effective_threshold_units = THRESHOLD
+        else:
+            if REQUIRE_EXPLICIT_THRESHOLD and cfg_threshold is None:
+                metrics_inc("skip_filtered_ws")
+                logger.debug(f"WS skip for '{name}': explicit per-item threshold required")
+                return
+            try:
+                if cfg_threshold is not None:
+                    effective_threshold_units = int(cfg_threshold)
+                else:
+                    effective_threshold_units = int(baseline * (1.0 - floating_margin))
+            except Exception:
+                effective_threshold_units = THRESHOLD
 
         # Apply hard safety cap from environment so restart cannot expand buy limit unexpectedly.
         if HARD_MAX_BUY_UNITS > 0:
@@ -3053,18 +3058,21 @@ def process_item(item):
             baseline = THRESHOLD
         floating_margin = float(state.get("floating_margin_pct", 0.10))
         cfg_threshold = state.get("thresholds", {}).get(norm)
-        if REQUIRE_EXPLICIT_THRESHOLD and cfg_threshold is None:
-            metrics_inc("skip_filtered_rest")
-            logger.debug(f"REST skip for '{name}': explicit per-item threshold required")
-            save_state()
-            return
-        try:
-            if cfg_threshold is not None:
-                effective_threshold_units = int(cfg_threshold)
-            else:
-                effective_threshold_units = int(baseline * (1.0 - floating_margin))
-        except Exception:
+        if FORCE_ENV_THRESHOLD:
             effective_threshold_units = THRESHOLD
+        else:
+            if REQUIRE_EXPLICIT_THRESHOLD and cfg_threshold is None:
+                metrics_inc("skip_filtered_rest")
+                logger.debug(f"REST skip for '{name}': explicit per-item threshold required")
+                save_state()
+                return
+            try:
+                if cfg_threshold is not None:
+                    effective_threshold_units = int(cfg_threshold)
+                else:
+                    effective_threshold_units = int(baseline * (1.0 - floating_margin))
+            except Exception:
+                effective_threshold_units = THRESHOLD
 
         # Apply hard safety cap from environment so restart cannot expand buy limit unexpectedly.
         if HARD_MAX_BUY_UNITS > 0:
