@@ -61,6 +61,9 @@ HARD_MAX_BUY_UNITS = int(round(HARD_MAX_BUY_PRICE_USD * 1000)) if HARD_MAX_BUY_P
 REQUIRE_EXPLICIT_THRESHOLD = os.getenv("REQUIRE_EXPLICIT_THRESHOLD", "1") in ("1", "true", "True", "yes", "on")
 RESET_THRESHOLDS_ON_START = os.getenv("RESET_THRESHOLDS_ON_START", "1") in ("1", "true", "True", "yes", "on")
 RESET_MODE_ON_START = os.getenv("RESET_MODE_ON_START", "1") in ("1", "true", "True", "yes", "on")
+AUTO_MODE_ON_START = os.getenv("AUTO_MODE_ON_START", "0") in ("1", "true", "True", "yes", "on")
+BUY_MODE = os.getenv("BUY_MODE", "").strip().lower()
+AUTO_MODE_FROM_ENV = BUY_MODE == "auto"
 SAFE_START_THRESHOLD_USD = float(os.getenv("SAFE_START_THRESHOLD_USD", "0"))
 SAFE_START_THRESHOLD_UNITS = int(round(SAFE_START_THRESHOLD_USD * 1000)) if SAFE_START_THRESHOLD_USD > 0 else 0
 # How to apply ignore: 'id' = prefer listing id (default), 'name' = ignore by market_hash_name
@@ -865,7 +868,12 @@ if RESET_THRESHOLDS_ON_START:
     state["global_threshold"] = SAFE_START_THRESHOLD_UNITS
     startup_changed = True
 
-if RESET_MODE_ON_START and state.get("mode") != "MANUAL":
+if AUTO_MODE_ON_START or AUTO_MODE_FROM_ENV:
+    if state.get("mode") != "AUTO":
+        logger.info("AUTO_MODE_ON_START enabled: forcing AUTO mode on startup")
+        state["mode"] = "AUTO"
+        startup_changed = True
+elif RESET_MODE_ON_START and state.get("mode") != "MANUAL":
     logger.info("RESET_MODE_ON_START enabled: forcing MANUAL mode on startup")
     state["mode"] = "MANUAL"
     startup_changed = True
