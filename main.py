@@ -100,6 +100,8 @@ OFFER_FETCH_RETRY_DELAY_SEC = float(os.getenv("OFFER_FETCH_RETRY_DELAY_SEC", "0.
 # Max-chance controls for auto-buy attempts.
 ALLOW_BLIND_BUY = os.getenv("ALLOW_BLIND_BUY", "1") in ("1", "true", "True", "yes", "on")
 REFRESH_OFFER_ON_NOT_FOUND = os.getenv("REFRESH_OFFER_ON_NOT_FOUND", "1") in ("1", "true", "True", "yes", "on")
+# Include Alfaskin listings in buy search (0 or 1). Default 0 (exclude).
+BUY_ALFASKIN = int(os.getenv("BUY_ALFASKIN", "0"))
 # Temporary cooldown for problematic lot IDs (seconds).
 FAILED_OFFER_COOLDOWN_SEC = int(os.getenv("FAILED_OFFER_COOLDOWN_SEC", "20"))
 # Balance cache for fast AUTO loops (seconds). 0 disables cache.
@@ -605,6 +607,22 @@ def mark_offer_cooldown(offer_id, reason: str = ""):
         logger.debug("Offer id %s cooldown set for %ss (%s)", key, FAILED_OFFER_COOLDOWN_SEC, str(reason)[:120])
     except Exception:
         logger.exception("Failed to mark offer cooldown")
+
+
+def resolve_buy_alfaskin(raw) -> int | None:
+    """Return 0/1 for buy_alfaskin parameter based on env and offer source."""
+    try:
+        if BUY_ALFASKIN not in (0, 1):
+            return None
+        if BUY_ALFASKIN <= 0:
+            return 0
+        if isinstance(raw, dict):
+            src = str(raw.get("source") or "").upper()
+            if src == "ALFASKIN":
+                return 1
+        return BUY_ALFASKIN
+    except Exception:
+        return None
 
 
 def make_item_key_from_raw(raw: dict) -> str:
@@ -1218,6 +1236,8 @@ async def debounced_auto_buy(key: str):
             tgt_price = int(target_offer.get("price_units", price_units))
             buy_price_limit = int(threshold_units or tgt_price)
             offer_id_for_buy = target_offer.get("offer_id") if isinstance(target_offer, dict) else None
+            offer_raw = target_offer.get("raw") if isinstance(target_offer, dict) else None
+            offer_buy_alfaskin = resolve_buy_alfaskin(offer_raw)
 
             # Skip recently poisoned/vanished lots for a short cooldown window.
             if is_offer_on_cooldown(offer_id_for_buy):
@@ -1257,8 +1277,9 @@ async def debounced_auto_buy(key: str):
                 name,
                 buy_price_limit,
                 source="auto",
-                raw=target_offer.get("raw") if isinstance(target_offer, dict) else None,
+                raw=offer_raw,
                 offer_id=offer_id_for_buy,
+                buy_alfaskin=offer_buy_alfaskin,
             )
             if ok:
                 bought_count += 1
@@ -1311,6 +1332,7 @@ async def debounced_auto_buy(key: str):
                                 source="auto",
                                 raw=retry_offer.get("raw"),
                                 offer_id=retry_offer_id,
+                                buy_alfaskin=resolve_buy_alfaskin(retry_offer.get("raw")),
                             )
                             if ok2:
                                 bought_count += 1
@@ -2903,7 +2925,7 @@ async def buy_cheapest_by_hash_name(hash_name, threshold_units):
         logger.exception("Error during purchase")
         return False, "Error during purchase."
 
-async def buy_item(hash_name: str, price: int, source: str = "manual", raw=None, offer_id=None):
+async def buy_item(hash_name: str, price: int, source: str = "manual", raw=None, offer_id=None, buy_alfaskin: int | None = None):
     """Покупка предмета через API market.csgo.com."""
     # Safety: do not allow automatic-source purchases when mode is not AUTO
     try:
@@ -2922,6 +2944,10 @@ async def buy_item(hash_name: str, price: int, source: str = "manual", raw=None,
         params["id"] = offer_id
     else:
         params["hash_name"] = hash_name
+    if buy_alfaskin is None:
+        buy_alfaskin = resolve_buy_alfaskin(raw)
+    if buy_alfaskin in (0, 1):
+        params["buy_alfaskin"] = int(buy_alfaskin)
     try:
         # Reuse global session to reduce overhead and keep cookies/headers consistent
         await init_session()
@@ -2959,7 +2985,10 @@ async def buy_item(hash_name: str, price: int, source: str = "manual", raw=None,
 
         # Not success
         err = data.get("error") or data
+        code = data.get("code")
         logger.error(f"Failed to buy {hash_name}: {err}")
+        if code == 21 or (isinstance(err, str) and "inventory" in err.lower()):
+            logger.warning("Buy failed: inventory full (code 21). Free slots required.")
         # If provider says Not money, re-check balance to log real balance and avoid blind retries
         if isinstance(err, str) and "Not money" in err:
             try:
