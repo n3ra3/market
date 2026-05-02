@@ -51,6 +51,10 @@ _targets_env = os.getenv("TARGET_MARKET_HASH_NAME", "Sealed Genesis Terminal")
 TARGET_MARKET_HASHES = [t.strip() for t in _targets_env.split(",") if t.strip()]
 # Market currency handling (default USD to preserve existing behavior).
 MARKET_CURRENCY = (os.getenv("MARKET_CURRENCY", "USD") or "USD").strip().upper()
+AUTO_DETECT_CURRENCY = MARKET_CURRENCY in ("AUTO", "AUTODETECT")
+if AUTO_DETECT_CURRENCY:
+    # Use a safe default until we can resolve the real currency via API.
+    MARKET_CURRENCY = "USD"
 _currency_scale_env = os.getenv("CURRENCY_UNIT_SCALE")
 if _currency_scale_env:
     PRICE_UNITS_SCALE = int(_currency_scale_env)
@@ -74,6 +78,50 @@ def format_units(units: int) -> str:
 
 def format_value(val: float) -> str:
     return f"{float(val):.3f} {MARKET_CURRENCY}"
+
+
+def _currency_default_scale(currency: str) -> int:
+    if currency == "RUB":
+        return 100
+    return 1000
+
+
+def _threshold_env_for_currency(currency: str) -> str | None:
+    if currency == "RUB":
+        return os.getenv("DEFAULT_THRESHOLD_RUB")
+    if currency == "EUR":
+        return os.getenv("DEFAULT_THRESHOLD_EUR")
+    if currency == "USD":
+        return os.getenv("DEFAULT_THRESHOLD_USD")
+    return os.getenv("DEFAULT_THRESHOLD_VALUE")
+
+
+def apply_currency_settings(currency: str, *, reason: str = "") -> None:
+    global MARKET_CURRENCY, PRICE_UNITS_SCALE, REST_PRICES_URL
+    global DEFAULT_THRESHOLD_VALUE, THRESHOLD, HARD_MAX_BUY_UNITS, SAFE_START_THRESHOLD_UNITS
+
+    if not currency:
+        return
+
+    MARKET_CURRENCY = currency.strip().upper()
+    if _currency_scale_env:
+        PRICE_UNITS_SCALE = int(_currency_scale_env)
+    else:
+        PRICE_UNITS_SCALE = _currency_default_scale(MARKET_CURRENCY)
+
+    REST_PRICES_URL = f"https://market.csgo.com/api/v2/prices/{MARKET_CURRENCY}.json"
+
+    threshold_env = _threshold_env_for_currency(MARKET_CURRENCY)
+    DEFAULT_THRESHOLD_VALUE = float(threshold_env) if threshold_env else DEFAULT_THRESHOLD_USD
+    THRESHOLD = value_to_units(DEFAULT_THRESHOLD_VALUE)
+
+    HARD_MAX_BUY_UNITS = value_to_units(HARD_MAX_BUY_PRICE_VALUE) if HARD_MAX_BUY_PRICE_VALUE > 0 else 0
+    SAFE_START_THRESHOLD_UNITS = value_to_units(SAFE_START_THRESHOLD_VALUE) if SAFE_START_THRESHOLD_VALUE > 0 else 0
+
+    if reason:
+        logger.info(f"Currency set to {MARKET_CURRENCY} (scale={PRICE_UNITS_SCALE}). reason={reason}")
+    else:
+        logger.info(f"Currency set to {MARKET_CURRENCY} (scale={PRICE_UNITS_SCALE}).")
 
 # Default threshold from env (USD by default) -> units where 1 currency = PRICE_UNITS_SCALE.
 DEFAULT_THRESHOLD_USD = float(os.getenv("DEFAULT_THRESHOLD_USD", "0.29"))
@@ -248,6 +296,35 @@ async def market_get_text(session_obj, url: str, *, params=None, headers=None, t
         text = await response.text()
         content_type = response.headers.get("Content-Type", "")
         return status, text, content_type
+
+
+async def detect_currency_from_key() -> str | None:
+    """Try to detect account currency from the API key via get-money."""
+    try:
+        await init_session()
+        s = session
+        status, text, _ct = await market_get_text(
+            s,
+            "https://market.csgo.com/api/v2/get-money",
+            params={"key": API_KEY},
+            timeout=10,
+        )
+        if status != 200:
+            return None
+        try:
+            data = json.loads(text)
+        except Exception:
+            return None
+        if not data.get("success"):
+            return None
+
+        for key in ("currency", "currency_code", "currency_short", "currency_name"):
+            val = data.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip().upper()
+        return None
+    except Exception:
+        return None
 
 # Telemetry settings and in-memory counters.
 METRICS_WINDOW_SEC = int(os.getenv("METRICS_WINDOW_SEC", "300"))
@@ -3314,6 +3391,12 @@ def build_market_search_url(name: str) -> str:
 if __name__ == "__main__":
     # Run an aiohttp web server with /ping for health checks and run websocket_listener in background
     async def _on_startup(app):
+        if AUTO_DETECT_CURRENCY:
+            detected = await detect_currency_from_key()
+            if detected:
+                apply_currency_settings(detected, reason="auto-detect")
+            else:
+                apply_currency_settings("USD", reason="auto-detect-fallback")
         logger.info("Starting background websocket listener task")
         app['ws_task'] = asyncio.create_task(websocket_listener())
         logger.info("Starting metrics reporter task")
