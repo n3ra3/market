@@ -49,14 +49,53 @@ TARGET_NAME_ID = None  # Example: "12345" or None
 # Support multiple targets (comma-separated env var) e.g. "Sealed Genesis Terminal,Recoil Case"
 _targets_env = os.getenv("TARGET_MARKET_HASH_NAME", "Sealed Genesis Terminal")
 TARGET_MARKET_HASHES = [t.strip() for t in _targets_env.split(",") if t.strip()]
-# Default threshold from env (USD) -> units where 1 USD = 1000.
+# Market currency handling (default USD to preserve existing behavior).
+MARKET_CURRENCY = (os.getenv("MARKET_CURRENCY", "USD") or "USD").strip().upper()
+_currency_scale_env = os.getenv("CURRENCY_UNIT_SCALE")
+if _currency_scale_env:
+    PRICE_UNITS_SCALE = int(_currency_scale_env)
+else:
+    PRICE_UNITS_SCALE = 100 if MARKET_CURRENCY == "RUB" else 1000
+
+def value_to_units(value: float) -> int:
+    try:
+        return int(round(float(value) * PRICE_UNITS_SCALE))
+    except Exception:
+        return int(round(0.0))
+
+def units_to_value(units: int) -> float:
+    try:
+        return float(units) / float(PRICE_UNITS_SCALE)
+    except Exception:
+        return 0.0
+
+def format_units(units: int) -> str:
+    return f"{units_to_value(units):.3f} {MARKET_CURRENCY}"
+
+def format_value(val: float) -> str:
+    return f"{float(val):.3f} {MARKET_CURRENCY}"
+
+# Default threshold from env (USD by default) -> units where 1 currency = PRICE_UNITS_SCALE.
 DEFAULT_THRESHOLD_USD = float(os.getenv("DEFAULT_THRESHOLD_USD", "0.29"))
-THRESHOLD = int(round(DEFAULT_THRESHOLD_USD * 1000))
+_threshold_env = None
+if MARKET_CURRENCY == "RUB":
+    _threshold_env = os.getenv("DEFAULT_THRESHOLD_RUB")
+elif MARKET_CURRENCY == "EUR":
+    _threshold_env = os.getenv("DEFAULT_THRESHOLD_EUR")
+elif MARKET_CURRENCY == "USD":
+    _threshold_env = os.getenv("DEFAULT_THRESHOLD_USD")
+else:
+    _threshold_env = os.getenv("DEFAULT_THRESHOLD_VALUE")
+
+DEFAULT_THRESHOLD_VALUE = float(_threshold_env) if _threshold_env else DEFAULT_THRESHOLD_USD
+THRESHOLD = value_to_units(DEFAULT_THRESHOLD_VALUE)
 # Force env threshold for tests (ignores floating thresholds/custom requirement).
 FORCE_ENV_THRESHOLD = os.getenv("FORCE_ENV_THRESHOLD", "0") in ("1", "true", "True", "yes", "on")
-# Hard safety cap from env (USD). If 0, cap is disabled.
+# Hard safety cap from env (USD by default). If 0, cap is disabled.
 HARD_MAX_BUY_PRICE_USD = float(os.getenv("HARD_MAX_BUY_PRICE_USD", "0"))
-HARD_MAX_BUY_UNITS = int(round(HARD_MAX_BUY_PRICE_USD * 1000)) if HARD_MAX_BUY_PRICE_USD > 0 else 0
+_hard_max_env = os.getenv("HARD_MAX_BUY_PRICE_VALUE")
+HARD_MAX_BUY_PRICE_VALUE = float(_hard_max_env) if _hard_max_env else HARD_MAX_BUY_PRICE_USD
+HARD_MAX_BUY_UNITS = value_to_units(HARD_MAX_BUY_PRICE_VALUE) if HARD_MAX_BUY_PRICE_VALUE > 0 else 0
 # Startup safety controls.
 REQUIRE_EXPLICIT_THRESHOLD = os.getenv("REQUIRE_EXPLICIT_THRESHOLD", "1") in ("1", "true", "True", "yes", "on")
 RESET_THRESHOLDS_ON_START = os.getenv("RESET_THRESHOLDS_ON_START", "1") in ("1", "true", "True", "yes", "on")
@@ -65,7 +104,9 @@ AUTO_MODE_ON_START = os.getenv("AUTO_MODE_ON_START", "0") in ("1", "true", "True
 BUY_MODE = os.getenv("BUY_MODE", "").strip().lower()
 AUTO_MODE_FROM_ENV = BUY_MODE == "auto"
 SAFE_START_THRESHOLD_USD = float(os.getenv("SAFE_START_THRESHOLD_USD", "0"))
-SAFE_START_THRESHOLD_UNITS = int(round(SAFE_START_THRESHOLD_USD * 1000)) if SAFE_START_THRESHOLD_USD > 0 else 0
+_safe_start_env = os.getenv("SAFE_START_THRESHOLD_VALUE")
+SAFE_START_THRESHOLD_VALUE = float(_safe_start_env) if _safe_start_env else SAFE_START_THRESHOLD_USD
+SAFE_START_THRESHOLD_UNITS = value_to_units(SAFE_START_THRESHOLD_VALUE) if SAFE_START_THRESHOLD_VALUE > 0 else 0
 # How to apply ignore: 'id' = prefer listing id (default), 'name' = ignore by market_hash_name
 IGNORE_BY = os.getenv("IGNORE_BY", "id")  # 'id' or 'name'
 
@@ -73,7 +114,7 @@ IGNORE_BY = os.getenv("IGNORE_BY", "id")  # 'id' or 'name'
 TELEGRAM_BOT_TOKEN = os.getenv("MARKET_TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("MARKET_TELEGRAM_CHAT_ID")
 WS_URL = "wss://wsprice.csgo.com/connection/websocket"
-REST_PRICES_URL = "https://market.csgo.com/api/v2/prices/USD.json"
+REST_PRICES_URL = f"https://market.csgo.com/api/v2/prices/{MARKET_CURRENCY}.json"
 SEARCH_ITEM_SPECIFIC_URL = "https://market.csgo.com/api/v2/search-item-by-hash-name-specific"
 GET_WS_TOKEN_URL = "https://market.csgo.com/api/v2/get-ws-token"
 WS_ORIGIN = os.getenv("WS_ORIGIN", "https://market.csgo.com")
@@ -115,6 +156,10 @@ BALANCE_CACHE_TTL_SEC = float(os.getenv("BALANCE_CACHE_TTL_SEC", "2.0"))
 PURCHASE_LOG = os.path.join(os.getcwd(), "purchase_history.csv")
 DAILY_SPEND_LIMIT_USD = float(os.getenv("DAILY_SPEND_LIMIT_USD", "0"))  # 0 = disabled
 SESSION_SPEND_LIMIT_USD = float(os.getenv("SESSION_SPEND_LIMIT_USD", "0"))  # 0 = disabled
+_daily_limit_env = os.getenv("DAILY_SPEND_LIMIT_VALUE")
+_session_limit_env = os.getenv("SESSION_SPEND_LIMIT_VALUE")
+DAILY_SPEND_LIMIT_VALUE = float(_daily_limit_env) if _daily_limit_env else DAILY_SPEND_LIMIT_USD
+SESSION_SPEND_LIMIT_VALUE = float(_session_limit_env) if _session_limit_env else SESSION_SPEND_LIMIT_USD
 # Market API hard safety limit (<5 req/s per provider rules)
 MARKET_MAX_RPS = float(os.getenv("MARKET_MAX_RPS", "4.5"))
 MARKET_MIN_INTERVAL_SEC = 1.0 / MARKET_MAX_RPS if MARKET_MAX_RPS > 0 else 0.0
@@ -150,7 +195,7 @@ state = {"ignored": [], "confirmed": []}
 _last_state_save_ts = 0
 # Rate-limit repetitive upstream error logs.
 _last_balance_error_log_ts = 0
-_last_known_balance_usd = None
+_last_known_balance_value = None
 _last_known_balance_ts = 0
 _ws_last_error_ts = 0.0
 _market_last_request_ts = 0.0
@@ -378,7 +423,7 @@ def build_stats_text() -> str:
         if tv is None:
             target_thr.append(f"{t}: not set")
         else:
-            target_thr.append(f"{t}: {int(tv)} units (${int(tv)/1000:.3f})")
+            target_thr.append(f"{t}: {int(tv)} units ({format_units(int(tv))})")
 
     lines = [
         f"Stats window: {METRICS_WINDOW_SEC}s",
@@ -714,17 +759,17 @@ def _today_str():
     return time.strftime("%Y-%m-%d")
 
 
-def can_spend(amount_usd):
+def can_spend(amount_value):
     """Check daily and session spend limits. Returns (True, '') if allowed, else (False, reason)."""
     try:
-        if amount_usd is None:
+        if amount_value is None:
             return False, "invalid amount"
         today = _today_str()
         spent_today = float(state.setdefault("spent", {}).get(today, 0.0) or 0.0)
         session_spent = float(state.get("session_spent", 0.0) or 0.0)
-        if DAILY_SPEND_LIMIT_USD and (spent_today + amount_usd) > DAILY_SPEND_LIMIT_USD:
+        if DAILY_SPEND_LIMIT_VALUE and (spent_today + amount_value) > DAILY_SPEND_LIMIT_VALUE:
             return False, "daily limit exceeded"
-        if SESSION_SPEND_LIMIT_USD and (session_spent + amount_usd) > SESSION_SPEND_LIMIT_USD:
+        if SESSION_SPEND_LIMIT_VALUE and (session_spent + amount_value) > SESSION_SPEND_LIMIT_VALUE:
             return False, "session limit exceeded"
         return True, ""
     except Exception:
@@ -735,12 +780,22 @@ def can_spend(amount_usd):
 def record_purchase(hash_name, price_units, offer_id=None, raw=None, source="manual"):
     """Append successful purchase to CSV and update spend counters in state."""
     try:
-        price_usd = float(price_units) / 1000.0 if price_units is not None else 0.0
+        price_value = units_to_value(price_units) if price_units is not None else 0.0
         ts = int(time.time())
         today = _today_str()
-        header = ["timestamp", "iso", "name", "price_units", "price_usd", "offer_id", "source", "raw_json"]
+        header = ["timestamp", "iso", "name", "price_units", "price_value", "currency", "offer_id", "source", "raw_json"]
         iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
-        row = [ts, iso, hash_name, price_units, f"{price_usd:.3f}", offer_id or "", source, json.dumps(raw or {}, ensure_ascii=False)]
+        row = [
+            ts,
+            iso,
+            hash_name,
+            price_units,
+            f"{price_value:.3f}",
+            MARKET_CURRENCY,
+            offer_id or "",
+            source,
+            json.dumps(raw or {}, ensure_ascii=False),
+        ]
         write_header = not os.path.exists(PURCHASE_LOG)
         with open(PURCHASE_LOG, "a", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
@@ -749,12 +804,12 @@ def record_purchase(hash_name, price_units, offer_id=None, raw=None, source="man
             writer.writerow(row)
 
         # update state counters
-        state["session_spent"] = float(state.get("session_spent", 0.0) or 0.0) + price_usd
+        state["session_spent"] = float(state.get("session_spent", 0.0) or 0.0) + price_value
         state.setdefault("spent", {})
-        state["spent"][today] = float(state["spent"].get(today, 0.0) or 0.0) + price_usd
+        state["spent"][today] = float(state["spent"].get(today, 0.0) or 0.0) + price_value
         # Force immediate save after recording a purchase
         save_state(force=True)
-        logger.info(f"Recorded purchase: {hash_name} ${price_usd:.3f} to {PURCHASE_LOG}")
+        logger.info(f"Recorded purchase: {hash_name} {format_value(price_value)} to {PURCHASE_LOG}")
     except Exception:
         logger.exception("Failed to record purchase")
 
@@ -785,31 +840,31 @@ def extract_price_raw(item):
 
 
 def normalize_price(raw_p):
-    """Normalize extracted raw price into USD float when possible.
+    """Normalize extracted raw price into currency float when possible.
     Heuristics:
-    - numeric values >1000 are treated as "units" and divided by 1000
-    - numeric values <=1000 are treated as USD if fractional or plausible
-    - strings are parsed to float after removing $/USD
+    - numeric values >scale are treated as "units" and divided by PRICE_UNITS_SCALE
+    - numeric values <=scale are treated as currency if fractional or plausible
+    - strings are parsed to float after removing common currency markers
     - dicts are inspected for common keys
-    Returns float (USD) or None.
+    Returns float (currency) or None.
     """
     try:
         if raw_p is None:
             return None
         if isinstance(raw_p, (int, float)):
             num = float(raw_p)
-            if num > 1000:
-                return num / 1000.0
+            if num > PRICE_UNITS_SCALE:
+                return num / float(PRICE_UNITS_SCALE)
             return float(num)
         if isinstance(raw_p, str):
             s = raw_p.strip().replace(',', '.')
-            s = s.replace('$', '').replace('USD', '').strip()
+            s = s.replace('$', '').replace('USD', '').replace('RUB', '').replace('EUR', '').strip()
             try:
                 num = float(s)
             except Exception:
                 return None
-            if num > 1000:
-                return num / 1000.0
+            if num > PRICE_UNITS_SCALE:
+                return num / float(PRICE_UNITS_SCALE)
             return num
         if isinstance(raw_p, dict):
             for k in ("amount", "price", "value", "price_usd"):
@@ -1002,7 +1057,7 @@ async def websocket_listener():
                 if fallback_task and not fallback_task.done():
                     fallback_task.cancel()
                 metrics_set_mode("ws")
-                subscription_message = json.dumps({"type": "subscribe", "data": "public:items:730:usd"})
+                subscription_message = json.dumps({"type": "subscribe", "data": f"public:items:730:{MARKET_CURRENCY.lower()}"})
                 await websocket.send(subscription_message)
                 if DEBUG_MODE:
                     logger.debug(f"Sent subscription message: {subscription_message}")
@@ -1182,7 +1237,7 @@ async def debounced_auto_buy(key: str):
         # choose cheapest offer
         cheapest = min(offers, key=lambda o: o.get("price_units", 10**12))
         price_units = int(cheapest.get("price_units"))
-        logger.info(f"Debounced AUTO buy: attempting single purchase for '{name}' cheapest={price_units/1000.0:.3f} USD from {len(offers)} offers")
+        logger.info(f"Debounced AUTO buy: attempting single purchase for '{name}' cheapest={format_units(price_units)} from {len(offers)} offers")
         try:
             earliest_signal_ts = min(float(o.get("signal_ts", start_time)) for o in offers)
             metrics_add_attempt_delay(max(0.0, time.time() - earliest_signal_ts))
@@ -1199,7 +1254,7 @@ async def debounced_auto_buy(key: str):
             await init_session()
             s = session
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                await send_simple_message(s, TELEGRAM_CHAT_ID, f"AUTO: aggregated {len(offers)} offers for {name}, buying cheapest ${price_units/1000.0:.3f}")
+                await send_simple_message(s, TELEGRAM_CHAT_ID, f"AUTO: aggregated {len(offers)} offers for {name}, buying cheapest {format_units(price_units)}")
         except Exception:
             logger.exception("Failed to send debounced AUTO attempt message")
 
@@ -1216,7 +1271,7 @@ async def debounced_auto_buy(key: str):
             logger.info(
                 "Debounced AUTO buy skipped for %s: no concrete offers returned under threshold %.3f",
                 name,
-                threshold_units / 1000.0,
+                units_to_value(threshold_units),
             )
             return
         elif MAX_BATCH_BUY <= 0:
@@ -1270,13 +1325,15 @@ async def debounced_auto_buy(key: str):
 
             tried_count += 1
 
-            if local_balance is not None and local_balance < (tgt_price / 1000.0):
-                logger.warning(f"Batch buy stopped: insufficient balance for next lot. needed={tgt_price/1000.0:.3f}, balance={local_balance:.3f}")
+            if local_balance is not None and local_balance < units_to_value(tgt_price):
+                logger.warning(
+                    f"Batch buy stopped: insufficient balance for next lot. needed={units_to_value(tgt_price):.3f}, balance={local_balance:.3f}"
+                )
                 last_err = f"insufficient_balance:{local_balance}"
                 break
 
             # Check spend limits stored in state
-            allowed, reason = can_spend(tgt_price / 1000.0)
+            allowed, reason = can_spend(units_to_value(tgt_price))
             if not allowed:
                 logger.warning(f"Batch buy stopped by spend limits: {reason}")
                 last_err = reason
@@ -1294,7 +1351,7 @@ async def debounced_auto_buy(key: str):
             if ok:
                 bought_count += 1
                 if local_balance is not None:
-                    local_balance = max(0.0, local_balance - (buy_price_limit / 1000.0))
+                    local_balance = max(0.0, local_balance - units_to_value(buy_price_limit))
                 try:
                     purchases_made.append({
                         "price_units": buy_price_limit,
@@ -1347,7 +1404,7 @@ async def debounced_auto_buy(key: str):
                             if ok2:
                                 bought_count += 1
                                 if local_balance is not None:
-                                    local_balance = max(0.0, local_balance - (buy_price_limit / 1000.0))
+                                    local_balance = max(0.0, local_balance - units_to_value(buy_price_limit))
                                 try:
                                     purchases_made.append({
                                         "price_units": buy_price_limit,
@@ -1363,7 +1420,8 @@ async def debounced_auto_buy(key: str):
                             if should_cooldown_offer_error(res2):
                                 mark_offer_cooldown(retry_offer_id, reason=str(res2))
                 logger.warning(
-                    f"Batch buy attempt failed for {name}: signal={tgt_price/1000.0:.3f}, limit={buy_price_limit/1000.0:.3f}, err={res}"
+                    f"Batch buy attempt failed for {name}: signal={units_to_value(tgt_price):.3f}, "
+                    f"limit={units_to_value(buy_price_limit):.3f}, err={res}"
                 )
                 # Keep scanning all available offers below threshold in this batch.
                 continue
@@ -1397,11 +1455,13 @@ async def debounced_auto_buy(key: str):
                 for idx, p in enumerate(purchases_made, start=1):
                     pu = int(p.get("price_units", 0))
                     sig_pu = int(p.get("signal_price_units", pu))
-                    total += (pu / 1000.0)
+                    total += units_to_value(pu)
                     pid = p.get("id") or "-"
                     tstr = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(p.get("ts", int(time.time()))))
-                    lines.append(f"{idx}. limit=${pu/1000.0:.3f} signal=${sig_pu/1000.0:.3f} id={pid} at {tstr}")
-                lines.append(f"Total: ${total:.3f}")
+                    lines.append(
+                        f"{idx}. limit={format_units(pu)} signal={format_units(sig_pu)} id={pid} at {tstr}"
+                    )
+                lines.append(f"Total: {total:.3f} {MARKET_CURRENCY}")
                 text = "\n".join(lines)
                 # If too long, send as document
                 if len(text) > 3500:
@@ -1482,7 +1542,7 @@ async def fetch_available_offers(name: str, max_price_units: int):
 
                             # specific endpoint usually returns integer units (e.g. 13 => $0.013)
                             if isinstance(raw_price, str) and "." in raw_price:
-                                pu = int(float(raw_price) * 1000)
+                                pu = value_to_units(float(raw_price))
                             else:
                                 pu = int(float(raw_price))
 
@@ -1529,7 +1589,7 @@ async def fetch_available_offers(name: str, max_price_units: int):
                             if raw_price is None:
                                 continue
                             p = float(raw_price)
-                            pu = int(p * 1000)
+                            pu = value_to_units(p)
                             if pu <= int(max_price_units):
                                 offer_id = extract_offer_id(it)
                                 if offer_id and is_processed_offer(offer_id):
@@ -1586,7 +1646,7 @@ async def fetch_specific_offers(name: str, max_price_units: int):
                                 continue
 
                             if isinstance(raw_price, str) and "." in raw_price:
-                                pu = int(float(raw_price) * 1000)
+                                pu = value_to_units(float(raw_price))
                             else:
                                 pu = int(float(raw_price))
 
@@ -1632,7 +1692,7 @@ def process_event(event):
 
         try:
             price_float = float(raw_price)
-            price_units = int(price_float * 1000)
+            price_units = value_to_units(price_float)
         except Exception:
             metrics_inc("skip_filtered_ws")
             return
@@ -1682,7 +1742,9 @@ def process_event(event):
 
         # If price (in units) is higher than the effective threshold, skip
         # Log decision details for debugging
-        logger.debug(f"WS check for '{name}': price_units={price_units}, effective_threshold_units={effective_threshold_units}, cfg_threshold={cfg_threshold}")
+        logger.debug(
+            f"WS check for '{name}': price_units={price_units}, effective_threshold_units={effective_threshold_units}, cfg_threshold={cfg_threshold}"
+        )
         if price_units > effective_threshold_units:
             metrics_inc("skip_filtered_ws")
             logger.debug(f"Skipping WS item '{name}': price {price_units} > threshold {effective_threshold_units}")
@@ -1729,26 +1791,36 @@ async def handle_auto_mode(name, price_units):
             async with session.get(f"https://market.csgo.com/api/v2/get-money", params={"key": API_KEY}) as response:
                 data = await response.json()
                 if data.get("success"):
-                    balance_usd = float(data.get("money", 0))
+                    balance_value = float(data.get("money", 0))
                     # Проверяем, хватает ли баланса для покупки
-                    if balance_usd >= (price_units / 1000):
+                    if balance_value >= units_to_value(price_units):
                         # Логируем попытку покупки и уведомляем кратко (без кнопок)
-                        logger.info(f"AUTO found: {name} for {price_units / 1000:.2f} USD. Attempting purchase...")
+                        logger.info(
+                            f"AUTO found: {name} for {format_units(price_units)}. Attempting purchase..."
+                        )
                         try:
                             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                                await send_simple_message(session, TELEGRAM_CHAT_ID, f"AUTO: attempting to buy {name} for ${price_units/1000:.3f}")
+                                await send_simple_message(
+                                    session,
+                                    TELEGRAM_CHAT_ID,
+                                    f"AUTO: attempting to buy {name} for {format_units(price_units)}",
+                                )
                             else:
-                                print(f"AUTO: attempting to buy {name} for ${price_units/1000:.3f}")
+                                print(f"AUTO: attempting to buy {name} for {format_units(price_units)}")
                         except Exception:
                             logger.exception("Failed to send AUTO attempt message")
 
                         # Check spend limits before attempting
-                        allowed, reason = can_spend(price_units / 1000.0)
+                        allowed, reason = can_spend(units_to_value(price_units))
                         if not allowed:
                             logger.warning(f"AUTO purchase blocked by limits: {reason}")
                             try:
                                 if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                                    await send_simple_message(session, TELEGRAM_CHAT_ID, f"AUTO: blocked purchase of {name} for ${price_units/1000:.3f}: {reason}")
+                                    await send_simple_message(
+                                        session,
+                                        TELEGRAM_CHAT_ID,
+                                        f"AUTO: blocked purchase of {name} for {format_units(price_units)}: {reason}",
+                                    )
                                 else:
                                     print(f"AUTO blocked: {reason}")
                             except Exception:
@@ -1760,9 +1832,13 @@ async def handle_auto_mode(name, price_units):
                         if ok:
                             try:
                                 if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                                    await send_simple_message(session, TELEGRAM_CHAT_ID, f"AUTO: bought {name} for ${price_units/1000:.3f}")
+                                    await send_simple_message(
+                                        session,
+                                        TELEGRAM_CHAT_ID,
+                                        f"AUTO: bought {name} for {format_units(price_units)}",
+                                    )
                                 else:
-                                    print(f"AUTO: bought {name} for ${price_units/1000:.3f}")
+                                    print(f"AUTO: bought {name} for {format_units(price_units)}")
                             except Exception:
                                 logger.exception("Failed to send AUTO success message")
                             return
@@ -1827,10 +1903,14 @@ async def handle_telegram_callback(data_cd, cq_id, session, cq=None):
                 logger.debug(f"awaiting_custom set for chat {chat_id}: hash_name={hash_name}. keys={list(awaiting_custom.keys())}")
             except Exception:
                 logger.debug("awaiting_custom updated (debug failed to format keys)")
-            await answer_callback(session, cq_id, f"Send custom price (USD) for {hash_name} in chat now.")
+            await answer_callback(session, cq_id, f"Send custom price ({MARKET_CURRENCY}) for {hash_name} in chat now.")
             # Send a ForceReply so Telegram clients prompt the user to reply and update will contain the message
             try:
-                fr_payload = {"chat_id": chat_id, "text": f"Please reply with a price in USD for '{hash_name}', e.g. 0.29", "reply_markup": json.dumps({"force_reply": True, "selective": True})}
+                fr_payload = {
+                    "chat_id": chat_id,
+                    "text": f"Please reply with a price in {MARKET_CURRENCY} for '{hash_name}', e.g. 0.29",
+                    "reply_markup": json.dumps({"force_reply": True, "selective": True}),
+                }
                 send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                 async with session.post(send_url, json=fr_payload) as fr_resp:
                     fr_text = await fr_resp.text()
@@ -1863,12 +1943,15 @@ async def handle_telegram_callback(data_cd, cq_id, session, cq=None):
                 data = await response.json()
                 logger.debug(f"get-money response for confirm_buy: {data}")
                 if data.get("success"):
-                            # API returns money as USD float (e.g. 18.191)
-                            balance_usd = float(data.get("money", 0))
-                            logger.debug(f"Balance (USD): {balance_usd}, limit_units: {limit_units}, limit_USD: {limit_units/1000:.3f}")
-                            if balance_usd >= (limit_units / 1000):
+                            # API returns money in the API key currency (e.g. 18.191)
+                            balance_value = float(data.get("money", 0))
+                            logger.debug(
+                                f"Balance ({MARKET_CURRENCY}): {balance_value}, limit_units: {limit_units}, "
+                                f"limit_value: {units_to_value(limit_units):.3f}"
+                            )
+                            if balance_value >= units_to_value(limit_units):
                                 # Check spend limits
-                                allowed, reason = can_spend(limit_units / 1000.0)
+                                allowed, reason = can_spend(units_to_value(limit_units))
                                 if not allowed:
                                     await answer_callback(session, cq_id, "Blocked by spend limits")
                                     await send_simple_message(session, chat_id, f"Purchase blocked: {reason}")
@@ -1877,7 +1960,11 @@ async def handle_telegram_callback(data_cd, cq_id, session, cq=None):
                                     logger.debug(f"buy response: {res}")
                                     if ok:
                                         await answer_callback(session, cq_id, "Purchase successful.")
-                                        await send_simple_message(session, chat_id, f"Successfully bought {hash_name} for {limit_units / 1000:.2f} USD.")
+                                        await send_simple_message(
+                                            session,
+                                            chat_id,
+                                            f"Successfully bought {hash_name} for {format_units(limit_units)}.",
+                                        )
                                     else:
                                         await answer_callback(session, cq_id, "Purchase failed.")
                                         await send_simple_message(session, chat_id, f"Failed to buy {hash_name}: {res}")
@@ -1890,7 +1977,7 @@ async def handle_telegram_callback(data_cd, cq_id, session, cq=None):
             # Set per-item threshold (limit is in units) using normalized key
             state.setdefault("thresholds", {})[normalize_name(hash_name)] = limit_units
             save_state()
-            await answer_callback(session, cq_id, f"Threshold for {hash_name} set to {limit_units/1000:.3f}$")
+            await answer_callback(session, cq_id, f"Threshold for {hash_name} set to {format_units(limit_units)}")
             await handle_menu_command(session, TELEGRAM_CHAT_ID)
         elif action == "clear_threshold":
             if "thresholds" in state and normalize_name(hash_name) in state["thresholds"]:
@@ -2014,7 +2101,7 @@ async def poll_telegram_updates():
                                 # parse price like 0.29 or 0,29
                                 try:
                                     price_val = float(text_msg.replace(',', '.'))
-                                    units = int(round(price_val * 1000))
+                                    units = value_to_units(price_val)
                                     nk = normalize_name(hash_name)
                                     state.setdefault("thresholds", {})[nk] = units
                                     save_state()
@@ -2091,7 +2178,7 @@ async def poll_telegram_updates():
                             logger.info(f"/set parsed: item='{item}' num='{num}'")
                             try:
                                 price_val = float(num)
-                                units = int(round(price_val * 1000))
+                                units = value_to_units(price_val)
                                 nk = normalize_name(item)
                                 old = state.get("thresholds", {}).get(nk)
                                 state.setdefault("thresholds", {})[nk] = units
@@ -2102,15 +2189,22 @@ async def poll_telegram_updates():
                                 try:
                                     recent = state.get("recent_prices", {}).get(nk, [])
                                     if recent:
-                                        latest = recent[-1] / 1000.0
+                                        latest = units_to_value(recent[-1])
                                 except Exception:
                                     latest = None
                                 if latest is None:
                                     status = "Нет данных о последней цене."
                                 else:
-                                    status = (f"Последняя цена ${latest:.3f} ≤ порог; уведомления будут срабатывать." if latest <= price_val
-                                              else f"Последняя цена ${latest:.3f} > порог; уведомления не будут до снижения цены.")
-                                await send_simple_message(tg_session, chat_id_msg, f"Порог для '{item}' установлен: {price_val:.3f}$ ({units} units). {status}\nStored key: '{nk}'")
+                                    status = (
+                                        f"Последняя цена {latest:.3f} {MARKET_CURRENCY} ≤ порог; уведомления будут срабатывать."
+                                        if latest <= price_val
+                                        else f"Последняя цена {latest:.3f} {MARKET_CURRENCY} > порог; уведомления не будут до снижения цены."
+                                    )
+                                await send_simple_message(
+                                    tg_session,
+                                    chat_id_msg,
+                                    f"Порог для '{item}' установлен: {format_value(price_val)} ({units} units). {status}\nStored key: '{nk}'",
+                                )
                             except Exception:
                                 logger.exception("Exception while processing /set")
                                 await send_simple_message(tg_session, chat_id_msg, "Не удалось установить порог. Укажите число, например 0.29")
@@ -2133,7 +2227,7 @@ async def poll_telegram_updates():
                             # Show current thresholds and margin
                             try:
                                 thr = state.get("thresholds", {})
-                                lines = [f"{k}: {v/1000:.3f}$ ({v} units)" for k, v in thr.items()]
+                                lines = [f"{k}: {format_units(v)} ({v} units)" for k, v in thr.items()]
                                 margin = state.get("floating_margin_pct", 0.10)
                                 header = f"Floating margin: {margin} ({margin*100:.2f}%)\n"
                                 body = "\n".join(lines) if lines else "(no thresholds set)"
@@ -2683,7 +2777,8 @@ async def export_operation_history_to_csv(
             writer.writerow([
                 "datetime",
                 "item",
-                "paid_usd",
+                "paid_value",
+                "currency",
                 "stage",
                 "app",
                 "item_id",
@@ -2728,7 +2823,8 @@ async def export_operation_history_to_csv(
                 writer.writerow([
                     _format_ts(item.get("time")),
                     item.get("market_hash_name") or item.get("name") or "",
-                    f"{paid_units/1000.0:.3f}",
+                    f"{units_to_value(paid_units):.3f}",
+                    MARKET_CURRENCY,
                     _stage_label(item.get("stage")),
                     item.get("app"),
                     item.get("item_id") or item.get("id"),
@@ -2759,7 +2855,7 @@ async def export_operation_history_to_csv(
     summary = (
         f"History scope={scope_text}. Mode={mode_label}. Entries: {len(entries)}. "
         f"buy={buys}, sell={sells}, checkout={checkouts}. "
-        f"total_paid=${total_paid_units/1000.0:.3f}. source={source_endpoint}. API requests: {req_count}."
+        f"total_paid={units_to_value(total_paid_units):.3f} {MARKET_CURRENCY}. source={source_endpoint}. API requests: {req_count}."
     )
     if failed_ranges > 0:
         summary += f" WARNING: partial result, failed_ranges={failed_ranges}."
@@ -2778,9 +2874,9 @@ async def get_balance():
             async with session.get("https://market.csgo.com/api/v2/get-money", params={"key": API_KEY}) as response:
                 data = await response.json()
                 if data.get("success"):
-                    # API returns money as USD float (e.g. 18.191)
+                    # API returns money in the API key currency (e.g. 18.191)
                     balance = float(data.get("money", 0))
-                    logger.info(f"Current balance: ${balance}")
+                    logger.info(f"Current balance: {format_value(balance)}")
                     return balance
                 else:
                     logger.error(f"Failed to fetch balance: {data}")
@@ -2833,10 +2929,10 @@ async def handle_balance_command(session, chat_id):
                 if data.get("success"):
                     money = float(data.get("money", 0))
                     money_settlement = data.get("money_settlement")
-                    text = f"Balance: ${money:.3f} USD"
+                    text = f"Balance: {format_value(money)}"
                     if money_settlement is not None:
                         try:
-                            text += f"\nSettlement: ${float(money_settlement):.3f} USD"
+                            text += f"\nSettlement: {format_value(float(money_settlement))}"
                         except Exception:
                             text += f"\nSettlement: {money_settlement}"
                 else:
@@ -2849,13 +2945,13 @@ async def handle_balance_command(session, chat_id):
 # Функция для проверки баланса
 async def check_balance(force_refresh: bool = False):
     """Check the current balance, fetching from the API if necessary."""
-    global _last_balance_error_log_ts, _last_known_balance_usd, _last_known_balance_ts
+    global _last_balance_error_log_ts, _last_known_balance_value, _last_known_balance_ts
     try:
         # Fast path: reuse very recent balance to reduce latency and request pressure.
-        if not force_refresh and BALANCE_CACHE_TTL_SEC > 0 and _last_known_balance_usd is not None:
+        if not force_refresh and BALANCE_CACHE_TTL_SEC > 0 and _last_known_balance_value is not None:
             age = time.time() - float(_last_known_balance_ts or 0)
             if age >= 0 and age <= float(BALANCE_CACHE_TTL_SEC):
-                return float(_last_known_balance_usd)
+                return float(_last_known_balance_value)
 
         await init_session()
         s = session
@@ -2883,9 +2979,9 @@ async def check_balance(force_refresh: bool = False):
             return None
 
         if data.get("success"):
-            # API returns money as USD float
+            # API returns money in the API key currency
             bal = float(data.get("money", 0))
-            _last_known_balance_usd = bal
+            _last_known_balance_value = bal
             _last_known_balance_ts = int(time.time())
             return bal
 
@@ -2909,9 +3005,9 @@ async def buy_item_with_balance_check(hash_name: str, price: int):
         if balance is None:
             logger.warning("Balance check unavailable; continuing with buy attempt")
             balance = float("inf")
-        if balance >= price / 1000:
+        if balance >= units_to_value(price):
             # Check spend limits
-            allowed, reason = can_spend(price / 1000.0)
+            allowed, reason = can_spend(units_to_value(price))
             if not allowed:
                 logger.warning(f"Purchase blocked by limits: {reason}")
                 return
@@ -2984,12 +3080,16 @@ async def buy_item(hash_name: str, price: int, source: str = "manual", raw=None,
             return False, "invalid-json-response"
 
         if data.get("success"):
-            logger.info(f"Successfully bought {hash_name} for {price / 1000:.2f} USD")
+            logger.info(f"Successfully bought {hash_name} for {format_units(price)}")
             try:
                 record_purchase(hash_name, price, offer_id=data.get("id"), raw=raw, source=source)
                 try:
                     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                        await send_simple_message(s, TELEGRAM_CHAT_ID, f"Purchase recorded: {hash_name} for ${price/1000:.3f} (id: {data.get('id')})")
+                        await send_simple_message(
+                            s,
+                            TELEGRAM_CHAT_ID,
+                            f"Purchase recorded: {hash_name} for {format_units(price)} (id: {data.get('id')})",
+                        )
                 except Exception:
                     logger.exception("Failed to send purchase summary message")
             except Exception:
@@ -3049,7 +3149,7 @@ def process_item(item):
             return
 
         # Determine effective threshold per-item (units) using recent prices (floating)
-        price_units = int(price_float * 1000)
+        price_units = value_to_units(price_float)
         norm = normalize_name(name)
         recent = state.setdefault("recent_prices", {}).setdefault(norm, [])
         recent.append(price_units)
@@ -3085,7 +3185,10 @@ def process_item(item):
         # Apply hard safety cap from environment so restart cannot expand buy limit unexpectedly.
         if HARD_MAX_BUY_UNITS > 0:
             effective_threshold_units = min(effective_threshold_units, HARD_MAX_BUY_UNITS)
-        logger.debug(f"REST check for '{name}': price_units={price_units}, effective_threshold_units={effective_threshold_units}, cfg_threshold={cfg_threshold}, baseline={baseline}, floating_margin={floating_margin}, norm={norm}")
+        logger.debug(
+            f"REST check for '{name}': price_units={price_units}, effective_threshold_units={effective_threshold_units}, "
+            f"cfg_threshold={cfg_threshold}, baseline={baseline}, floating_margin={floating_margin}, norm={norm}"
+        )
         if price_units > effective_threshold_units:
             metrics_inc("skip_filtered_rest")
             logger.debug(f"Skipping REST item '{name}': price {price_units} > threshold {effective_threshold_units}")
@@ -3130,7 +3233,7 @@ async def notify_telegram(data):
 
     # Determine recommendation without extra API calls to avoid noisy errors during upstream outages.
     try:
-        price_units = int(float(price) * 1000)
+        price_units = value_to_units(float(price))
         norm = normalize_name(name)
         cfg_threshold = state.get("thresholds", {}).get(norm)
         if cfg_threshold is not None:
@@ -3144,7 +3247,7 @@ async def notify_telegram(data):
         price_units = None
         recommendation = "unknown"
 
-    text = f"{name}\nprice: ${price} ({price_units or 'N/A'} units)\nrecommendation: {recommendation}\nsource: {source}"
+    text = f"{name}\nprice: {format_value(price)} ({price_units or 'N/A'} units)\nrecommendation: {recommendation}\nsource: {source}"
 
     logger.info(f"[Telegram] Item matched: name={name}, price={price}, recommendation={recommendation}")
 
